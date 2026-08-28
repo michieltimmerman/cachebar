@@ -1,0 +1,19 @@
+[tasks.build]
+description = "Build CacheBar.app into ~/Applications (bundles ai-cache-bar.py)"
+run = "app/build.sh"
+
+[tasks.app]
+description = "Rebuild and (re)launch CacheBar.app"
+run = """
+app/build.sh
+pkill -f 'MacOS/CacheBar' || true
+open -n ~/Applications/CacheBar.app
+"""
+
+[tasks.status]
+description = "One-line-per-session cache summary in the terminal"
+run = "./ai-cache-bar.py --text"
+
+[tasks.json]
+description = "Machine-readable sessions + plan budget"
+run = "./ai-cache-bar.py --json"
