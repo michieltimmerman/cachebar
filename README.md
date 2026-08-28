@@ -137,10 +137,11 @@ by `message.id` first (Claude Code writes one line per content block with
 transcripts (~⅓ of real spend), and regress per-window token sums against the
 window's peak `fh`.
 
-## Why clicking a row opens Finder, not the chat
+## Why nothing is clickable
 
-There is no safe deep link into an existing desktop-app chat. Both routes in the
-app were tried:
+Rows and notifications are information, not actions: there is no safe deep link
+into an existing desktop-app chat, so there is nothing useful to open. Both
+routes in the app were tried:
 
 - `claude://code/continue?session=local_<uuid>` has the right semantics but its
   handler is behind an account feature gate that silently returns
@@ -151,8 +152,6 @@ app were tried:
   no liveness guard, unlike the app's own resume picker. Firing it at a live
   session **clones the chat**; in testing it also migrated the transcript to a
   different project directory and stripped its thinking blocks on disk. Don't.
-
-So rows and notification clicks reveal the transcript in Finder instead.
 
 ## Notifications need a real signing identity
 
