@@ -13,8 +13,8 @@ Providers, using only data these tools already write locally:
           Each turn refreshes the TTL, so deadline = last turn + 1h. Exact countdown.
   codex   ~/.codex/sessions/**/*.jsonl   — last_token_usage.cached_input_tokens per
           turn, one row per session_id (a resume spawns a new rollout file, so files
-          must be deduped). OpenAI implicit caching has no documented TTL and no
-          client control, so this reports hit-rate and idle time only, no countdown.
+          must be deduped). OpenAI implicit caching has no contractual TTL, so the
+          countdown is an estimate (CODEX_TTL, measured locally) shown with a ~.
 
 Chat titles come from the transcript's own "custom-title" / "ai-title" entries
 (a custom title wins), cached in .ai-cache-bar-titles.json so a full-file scan
@@ -47,6 +47,12 @@ import time
 
 TTL = int(os.environ.get("AI_CACHE_TTL_SECONDS", "3600"))
 WARN = int(os.environ.get("AI_CACHE_WARN_SECONDS", "600"))
+# Codex/OpenAI implicit caching has no contractual TTL. Measured on this account
+# (1019 call pairs, 2026-08-28): hits are ~100% up to 10 min idle, roughly
+# two-in-three between 10 and 30 min, gone by 2 h — matching OpenAI's "5-10
+# minutes typical, up to one hour" guidance. 600s is the reliably-warm window;
+# past it the row turns cold as "likely evicted", hedged because it is a guess.
+CODEX_TTL = int(os.environ.get("AI_CACHE_CODEX_TTL_SECONDS", "600"))
 LOOKBACK = int(os.environ.get("AI_CACHE_LOOKBACK_MIN", "240")) * 60
 TAIL_BYTES = int(os.environ.get("AI_CACHE_TAIL_BYTES", str(256 * 1024)))
 MAX_ROWS = int(os.environ.get("AI_CACHE_MAX_ROWS", "10"))
@@ -411,6 +417,7 @@ def claude_sessions(now, titles):
             + (usage.get("cache_read_input_tokens") or 0)
             + (usage.get("cache_creation_input_tokens") or 0),
             "ttl_known": True,
+            "ttl_estimate": False,
             "rewrote": rewrote,
             "rewrite_at": rewrite_at,
             "rewrite_age": (int(now - rewrite_at) if rewrite_at else None),
@@ -495,11 +502,12 @@ def codex_sessions(now):
                 "model": "codex",
                 "cwd": cwd,
                 "age": int(now - at),
-                "left": 0,
+                "left": int(CODEX_TTL - (now - at)),
                 "cached": cached,
                 "context": inp,
                 "hit_rate": (int(round(100.0 * cached / inp)) if inp else 0),
-                "ttl_known": False,
+                "ttl_known": True,
+                "ttl_estimate": True,
                 "app_session": None,
                 "path": path,
             }
@@ -530,7 +538,7 @@ def collect():
             r["state"] = "untracked"
         elif r["left"] <= 0:
             r["state"] = "cold"
-        elif r["left"] < WARN:
+        elif r["left"] < (max(60, CODEX_TTL // 4) if r.get("ttl_estimate") else WARN):
             r["state"] = "expiring"
         else:
             r["state"] = "warm"
@@ -569,9 +577,14 @@ def describe(r):
     if r["state"] == "untracked":
         return "%s cached · %d%% hit · idle %s" % (
             kt(r["cached"]), r.get("hit_rate", 0), hms(r["age"]))
+    est = r.get("ttl_estimate")
+    hit = (" · %d%% hit" % r["hit_rate"]) if r.get("hit_rate") is not None else ""
     if r["state"] == "cold":
+        if est:
+            return "likely evicted — idle %s%s" % (hms(r["age"]), hit)
         return "cold %s — rewrites %s" % (hms(r["age"]), kt(r["cached"]))
-    return "%s left · %s" % (hms(r["left"]), kt(r["cached"]))
+    return "%s%s left · %s%s" % ("~" if est else "", hms(r["left"]),
+                                 kt(r["cached"]), hit)
 
 
 def budget_line(b):
@@ -618,7 +631,9 @@ def render_swiftbar(rows, b=None):
             print("❄️ %s | color=#8899aa" % hms(t["age"]))
         else:
             colour = " | color=orange" if t["state"] == "expiring" else ""
-            print("%s %s%s" % (ICON[t["state"]], hms(t["left"]), colour))
+            print("%s %s%s%s" % (ICON[t["state"]],
+                                 "~" if t.get("ttl_estimate") else "",
+                                 hms(t["left"]), colour))
     print("---")
     warm = len([r for r in tracked if r["state"] in ("warm", "expiring")])
     print("Prompt cache · %d warm / %d recent | size=11 color=gray" % (warm, len(rows)))
@@ -672,8 +687,8 @@ def render_notify(rows, b=None):
                    % (b["chats"], b["compaction_pct_5h"], b["left_pct_5h"], who),
                    group="ai-cache-bar-budget")
     for r in rows:
-        if not r["ttl_known"] or r["age"] > NOTIFY_MAX_AGE:
-            continue  # only sessions you plausibly still have open
+        if not r["ttl_known"] or r["age"] > NOTIFY_MAX_AGE or r.get("ttl_estimate"):
+            continue  # estimated TTLs (codex) shape the display, never notifications
         current[r["session"]] = r["state"]
         # Cold tax already paid: a fresh prefix rewrite in this session.
         if r.get("rewrite_at"):

@@ -80,7 +80,8 @@ All knobs are environment variables read by `ai-cache-bar.py`:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `AI_CACHE_TTL_SECONDS` | `3600` | Cache TTL to assume |
+| `AI_CACHE_TTL_SECONDS` | `3600` | Claude cache TTL to assume |
+| `AI_CACHE_CODEX_TTL_SECONDS` | `600` | Codex estimated TTL (measured; see codex section) |
 | `AI_CACHE_WARN_SECONDS` | `600` | "Expiring" warning lead time |
 | `AI_CACHE_LOOKBACK_MIN` | `240` | How far back to look for sessions |
 | `AI_CACHE_MAX_ROWS` | `10` | Rows shown per surface |
@@ -164,12 +165,20 @@ or `osascript` as a last resort.
 
 ## Also here: codex
 
-`~/.codex/sessions/**/*.jsonl` rows show cached tokens, hit-rate and idle time
-only — OpenAI's implicit caching has no documented TTL and no client control, so
-no countdown is possible. A resume spawns a new rollout file, so rows dedupe by
-the `session_meta` head line's `session_id`. Chat names (auto-generated and user
-renames alike) live in `~/.codex/session_index.jsonl` as `thread_name`, keyed by
-that same id; unnamed chats fall back to a cwd@branch label.
+`~/.codex/sessions/**/*.jsonl` rows show cached tokens, hit-rate, and an
+**estimated** eviction countdown, marked with a `~`. OpenAI's implicit caching
+has no contractual TTL, so the window was measured from this account's own
+history (1,019 call pairs): hits are ~100% up to 10 minutes idle, roughly
+two-in-three between 10 and 30 minutes, and gone by 2 hours — matching OpenAI's
+"5–10 minutes typical, up to one hour" guidance. The countdown runs against the
+reliable 10-minute window (`AI_CACHE_CODEX_TTL_SECONDS`); past it the row says
+"likely evicted" rather than pretending certainty, and estimated TTLs shape the
+display but never fire notifications.
+
+A resume spawns a new rollout file, so rows dedupe by the `session_meta` head
+line's `session_id`. Chat names (auto-generated and user renames alike) live in
+`~/.codex/session_index.jsonl` as `thread_name`, keyed by that same id; unnamed
+chats fall back to a cwd@branch label.
 
 ## License
 

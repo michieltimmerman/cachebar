@@ -28,6 +28,7 @@ struct Session: Codable, Identifiable {
     let left: Int
     let cached: Int
     let ttl_known: Bool
+    let ttl_estimate: Bool?
     let state: String
     let hit_rate: Int?
     let rewrote: Int?
@@ -51,10 +52,13 @@ struct Session: Codable, Identifiable {
         if !ttl_known {
             return "\(kt(cached)) cached · \(hit_rate ?? 0)% hit · idle \(hms(age))"
         }
+        let est = ttl_estimate ?? false
+        let hit = hit_rate.map { " · \($0)% hit" } ?? ""
         if state == "cold" {
-            return "cold \(hms(age)) — rewrites \(kt(cached))"
+            return est ? "likely evicted — idle \(hms(age))\(hit)"
+                       : "cold \(hms(age)) — rewrites \(kt(cached))"
         }
-        return "\(hms(left)) left · \(kt(cached))"
+        return "\(est ? "~" : "")\(hms(left)) left · \(kt(cached))\(hit)"
     }
 }
 
@@ -244,12 +248,13 @@ final class Monitor: ObservableObject {
         sessions = rows
         budget = newBudget
         if let top = rows.first(where: { $0.ttl_known }) {
-            title = top.state == "cold" ? "❄️ \(hms(top.age))" : "\(top.icon) \(hms(top.left))"
+            let est = (top.ttl_estimate ?? false) ? "~" : ""
+            title = top.state == "cold" ? "❄️ \(hms(top.age))" : "\(top.icon) \(est)\(hms(top.left))"
         } else {
             title = "🫥"
         }
 
-        for row in rows where row.ttl_known && row.age < 7200 {
+        for row in rows where row.ttl_known && row.age < 7200 && !(row.ttl_estimate ?? false) {
             // Cold tax already paid: a fresh prefix rewrite in this session.
             if let wrote = row.rewrote, let at = row.rewrite_at {
                 let isNew = lastRewriteAt[row.session] != at
