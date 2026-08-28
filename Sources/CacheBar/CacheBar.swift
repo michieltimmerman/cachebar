@@ -13,6 +13,7 @@
 // Local notifications need a Developer ID / notarized app. So delivery goes through
 // terminal-notifier, which keeps click-to-open via -execute; the native path
 // switches on by itself if this ever gets a Developer ID signature.
+import ServiceManagement
 import SwiftUI
 import UserNotifications
 
@@ -198,6 +199,7 @@ final class Monitor: ObservableObject {
     @Published var budget: Budget?
     @Published var title = "…"
     @Published var notificationsEnabled = true
+    @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     private var lastState: [String: String] = [:]
     private var lastBudgetTight = false
@@ -308,6 +310,16 @@ final class Monitor: ObservableObject {
             transcript: target?.path ?? "")
     }
 
+    func setLaunchAtLogin(_ on: Bool) {
+        // The system owns this state; on failure the toggle just snaps back to
+        // whatever is actually registered.
+        do {
+            if on { try SMAppService.mainApp.register() }
+            else { try SMAppService.mainApp.unregister() }
+        } catch {}
+        launchAtLogin = SMAppService.mainApp.status == .enabled
+    }
+
     var warmCount: Int {
         sessions.filter { $0.ttl_known && ($0.state == "warm" || $0.state == "expiring") }.count
     }
@@ -340,6 +352,9 @@ struct CacheBarApp: App {
             }
             Divider()
             Toggle("Notify on expiry", isOn: $monitor.notificationsEnabled)
+            Toggle("Launch at login", isOn: Binding(
+                get: { monitor.launchAtLogin },
+                set: { monitor.setLaunchAtLogin($0) }))
             Button("Refresh now") { monitor.refresh() }
             Button("Send test notification") { monitor.sendTestNotification() }
             Divider()

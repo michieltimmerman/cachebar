@@ -37,22 +37,33 @@ chats warm is close to free; letting them chill is not.
 | File | What it is |
 |---|---|
 | `ai-cache-bar.py` | The single source of truth. Collects sessions, derives state, titles, and the plan budget. Emits `--json` (what the app consumes), `--text`, `--swiftbar`, `--notify`. Stdlib-only `/usr/bin/python3` so it runs under launchd/SwiftBar's minimal PATH. |
-| `app/CacheBar.swift` | SwiftUI `MenuBarExtra` that polls the Python every 15 s. All logic stays in the Python so the rules never fork between surfaces. |
-| `app/build.sh` | Builds `~/Applications/CacheBar.app` and bundles `ai-cache-bar.py` into its Resources, so a build deploys both halves. |
+| `Package.swift`, `Sources/CacheBar/` | The app, a plain SwiftPM executable: SwiftUI `MenuBarExtra` that polls the Python every 15 s. All logic stays in the Python so the rules never fork between surfaces. `swift build` works; so does opening the package in Xcode (`xed .`). |
+| `packaging/build.sh` | Release-builds via SwiftPM and assembles `CacheBar.app`: Info.plist, icon, codesigning, and `ai-cache-bar.py` bundled into Resources so a build deploys both halves. |
+| `packaging/make-icns.sh`, `render-icon.swift` | Regenerate the committed `CacheBar.icns` (only needed when the design changes). |
 | `cache-ttl.sh` | Older single-session tool: countdown, `--watch`, `--history` of cache invalidations, statusline widget via `--stdin`. Needs `jq`. |
 
 ## Install
 
-Requires macOS 14+, the Xcode toolchain (`swiftc`), and optionally
+Requires macOS 14+, the Xcode toolchain, and optionally
 [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) for
 notifications (see below).
 
 ```sh
 mise run app        # build and (re)launch CacheBar.app
 mise run status     # one-line-per-session summary in the terminal
+mise run dist       # shareable dist/CacheBar.zip
 ```
 
-Without mise: `app/build.sh && open -n ~/Applications/CacheBar.app`.
+Without mise: `packaging/build.sh && open -n ~/Applications/CacheBar.app`.
+
+The menu has a **Launch at login** toggle (`SMAppService`; it appears under
+System Settings → General → Login Items like any other app).
+
+Sharing the zip with another Mac: the app is signed with an Apple Development
+identity, not notarized, so Gatekeeper will block the first launch — right-click
+→ Open once. Proper distribution needs a paid Developer ID plus
+`xcrun notarytool`; `packaging/build.sh` picks up such an identity automatically
+via `CODESIGN_IDENTITY`, at which point native notifications also switch on.
 
 Alternative surfaces, no app needed:
 

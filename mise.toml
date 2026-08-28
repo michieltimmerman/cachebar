@@ -1,14 +1,27 @@
 [tasks.build]
-description = "Build CacheBar.app into ~/Applications (bundles ai-cache-bar.py)"
-run = "app/build.sh"
+description = "Build CacheBar.app into ~/Applications (SwiftPM + bundle assembly)"
+run = "packaging/build.sh"
 
 [tasks.app]
 description = "Rebuild and (re)launch CacheBar.app"
 run = """
-app/build.sh
+packaging/build.sh
 pkill -f 'MacOS/CacheBar' || true
 open -n ~/Applications/CacheBar.app
 """
+
+[tasks.dist]
+description = "Build a shareable zip of CacheBar.app into dist/"
+run = """
+packaging/build.sh dist/CacheBar.app
+ditto -c -k --keepParent dist/CacheBar.app dist/CacheBar.zip
+rm -rf dist/CacheBar.app
+echo "dist/CacheBar.zip"
+"""
+
+[tasks.icon]
+description = "Regenerate packaging/CacheBar.icns from render-icon.swift"
+run = "packaging/make-icns.sh"
 
 [tasks.status]
 description = "One-line-per-session cache summary in the terminal"

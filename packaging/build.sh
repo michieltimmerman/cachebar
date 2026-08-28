@@ -1,23 +1,22 @@
 #!/usr/bin/env bash
-# Build CacheBar.app into ~/Applications. Needs only the Xcode toolchain.
-# ai-cache-bar.py is bundled into Contents/Resources, so a build deploys both
-# halves and the app has no path into this repo at runtime.
+# Assemble CacheBar.app from a SwiftPM release build. Needs only the Xcode
+# toolchain. ai-cache-bar.py is bundled into Contents/Resources, so a build
+# deploys both halves and the app has no path into this repo at runtime.
+#
+# Usage: build.sh [target.app]   (default ~/Applications/CacheBar.app)
 set -euo pipefail
 
-SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(dirname "$SRC_DIR")"
+PKG_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP="${1:-$HOME/Applications/CacheBar.app}"
-BIN="$APP/Contents/MacOS/CacheBar"
+
+swift build -c release --package-path "$PKG_DIR"
+BIN_PATH="$(swift build -c release --package-path "$PKG_DIR" --show-bin-path)/CacheBar"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$REPO_DIR/ai-cache-bar.py" "$APP/Contents/Resources/ai-cache-bar.py"
-
-# -parse-as-library: a lone .swift file is otherwise treated as top-level code,
-# which conflicts with @main.
-swiftc -O -parse-as-library -target arm64-apple-macos14.0 \
-  -framework SwiftUI -framework AppKit \
-  "$SRC_DIR/CacheBar.swift" -o "$BIN"
+cp "$BIN_PATH" "$APP/Contents/MacOS/CacheBar"
+cp "$PKG_DIR/ai-cache-bar.py" "$APP/Contents/Resources/ai-cache-bar.py"
+cp "$PKG_DIR/packaging/CacheBar.icns" "$APP/Contents/Resources/CacheBar.icns"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -29,10 +28,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
        the CLI, so a denial recorded against an old id needs a new one. -->
   <key>CFBundleIdentifier</key><string>com.michieltimmerman.cachebar</string>
   <key>CFBundleName</key><string>CacheBar</string>
+  <key>CFBundleIconFile</key><string>CacheBar</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>1.1</string>
+  <key>CFBundleVersion</key><string>2</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
   <key>LSUIElement</key><true/>
 </dict>
 </plist>
