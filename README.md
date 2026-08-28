@@ -166,7 +166,10 @@ or `osascript` as a last resort.
 
 `~/.codex/sessions/**/*.jsonl` rows show cached tokens, hit-rate and idle time
 only — OpenAI's implicit caching has no documented TTL and no client control, so
-no countdown is possible.
+no countdown is possible. A resume spawns a new rollout file, so rows dedupe by
+the `session_meta` head line's `session_id`. Chat names (auto-generated and user
+renames alike) live in `~/.codex/session_index.jsonl` as `thread_name`, keyed by
+that same id; unnamed chats fall back to a cwd@branch label.
 
 ## License
 

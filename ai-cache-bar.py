@@ -424,6 +424,26 @@ def claude_sessions(now, titles):
     return list(out.values())
 
 
+def codex_titles():
+    """id -> thread_name from ~/.codex/session_index.jsonl (last entry wins).
+
+    This is where Codex keeps chat names — both its auto-generated ones and
+    user renames; the rollout files themselves never carry a title."""
+    out = {}
+    try:
+        with open(os.path.join(HOME, ".codex", "session_index.jsonl"), "rb") as fh:
+            for line in fh:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("id") and e.get("thread_name"):
+                    out[e["id"]] = e["thread_name"]
+    except OSError:
+        pass
+    return out
+
+
 def _codex_meta(path):
     """session_meta from a rollout file's first line ({} when absent)."""
     try:
@@ -439,9 +459,10 @@ def _codex_meta(path):
 def codex_sessions(now):
     # Codex starts a NEW rollout file on every resume, all carrying the same
     # session_id in their session_meta head line — so dedupe by that id or one
-    # chat shows up once per resume. There is no title concept; the label comes
-    # from the session's cwd, like an untitled claude row.
+    # chat shows up once per resume. Titles live in session_index.jsonl, not in
+    # the rollouts; the cwd-based label is the fallback for unnamed chats.
     out = {}
+    titles = codex_titles()
     pat = os.path.join(HOME, ".codex", "sessions", "**", "*.jsonl")
     for path in recent_files(pat, now):
         for line in reversed(tail_lines(path)):
@@ -468,7 +489,7 @@ def codex_sessions(now):
             row = {
                 "tool": "codex",
                 "session": sid,
-                "title": None,
+                "title": titles.get(sid),
                 "label": "codex " + (os.path.basename(cwd) or "?")
                 + (("@" + branch) if branch else ""),
                 "model": "codex",
