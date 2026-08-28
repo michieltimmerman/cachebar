@@ -29,6 +29,7 @@ struct Session: Codable, Identifiable {
     let cached: Int
     let ttl_known: Bool
     let ttl_estimate: Bool?
+    let maybe_pct: Int?
     let state: String
     let hit_rate: Int?
     let rewrote: Int?
@@ -44,6 +45,11 @@ struct Session: Codable, Identifiable {
         case "warm": return "🔥"
         case "expiring": return "⚠️"
         case "cold": return "❄️"
+        // codex: estimated states get a traffic light, not claude's
+        // deterministic fire/snow — past warm_s nothing is knowable.
+        case "est_warm": return "🟢"
+        case "uncertain": return "🟡"
+        case "est_gone": return "🔴"
         default: return "🟡"
         }
     }
@@ -52,13 +58,19 @@ struct Session: Codable, Identifiable {
         if !ttl_known {
             return "\(kt(cached)) cached · \(hit_rate ?? 0)% hit · idle \(hms(age))"
         }
-        let est = ttl_estimate ?? false
         let hit = hit_rate.map { " · \($0)% hit" } ?? ""
-        if state == "cold" {
-            return est ? "likely evicted — idle \(hms(age))\(hit)"
-                       : "cold \(hms(age)) — rewrites \(kt(cached))"
+        switch state {
+        case "est_warm":
+            return "~\(hms(left)) left · \(kt(cached))\(hit)"
+        case "uncertain":
+            return "maybe still warm (~\(maybe_pct ?? 50)%) · idle \(hms(age))\(hit)"
+        case "est_gone":
+            return "likely evicted — idle \(hms(age))\(hit)"
+        case "cold":
+            return "cold \(hms(age)) — rewrites \(kt(cached))"
+        default:
+            return "\(hms(left)) left · \(kt(cached))"
         }
-        return "\(est ? "~" : "")\(hms(left)) left · \(kt(cached))\(hit)"
     }
 }
 
@@ -206,6 +218,17 @@ final class Monitor: ObservableObject {
 
     func start() {
         Notifier.shared.requestAuthorization()
+        // Remeasure the codex eviction curve once per launch, off the poll path;
+        // regular polls read the cached fit.
+        let script = self.script
+        DispatchQueue.global(qos: .background).async {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            proc.arguments = [script, "--calibrate"]
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+            try? proc.run()
+        }
         refresh()
         // CACHEBAR_TEST_NOTIFICATION=1 fires one notification a few seconds after
         // launch, once authorization has had a chance to resolve.
@@ -249,7 +272,9 @@ final class Monitor: ObservableObject {
         budget = newBudget
         if let top = rows.first(where: { $0.ttl_known }) {
             let est = (top.ttl_estimate ?? false) ? "~" : ""
-            title = top.state == "cold" ? "❄️ \(hms(top.age))" : "\(top.icon) \(est)\(hms(top.left))"
+            title = ["cold", "est_gone", "uncertain"].contains(top.state)
+                ? "\(top.icon) \(hms(top.age))"
+                : "\(top.icon) \(est)\(hms(top.left))"
         } else {
             title = "🫥"
         }
@@ -321,7 +346,9 @@ final class Monitor: ObservableObject {
     }
 
     var warmCount: Int {
-        sessions.filter { $0.ttl_known && ($0.state == "warm" || $0.state == "expiring") }.count
+        sessions.filter {
+            $0.ttl_known && ["warm", "expiring", "est_warm"].contains($0.state)
+        }.count
     }
 }
 

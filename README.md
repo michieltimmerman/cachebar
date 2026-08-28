@@ -81,7 +81,7 @@ All knobs are environment variables read by `ai-cache-bar.py`:
 | Variable | Default | Meaning |
 |---|---|---|
 | `AI_CACHE_TTL_SECONDS` | `3600` | Claude cache TTL to assume |
-| `AI_CACHE_CODEX_TTL_SECONDS` | `600` | Codex estimated TTL (measured; see codex section) |
+| `AI_CACHE_CODEX_TTL_SECONDS` | *(self-calibrated)* | Override the measured codex reliably-warm window |
 | `AI_CACHE_WARN_SECONDS` | `600` | "Expiring" warning lead time |
 | `AI_CACHE_LOOKBACK_MIN` | `240` | How far back to look for sessions |
 | `AI_CACHE_MAX_ROWS` | `10` | Rows shown per surface |
@@ -167,13 +167,25 @@ or `osascript` as a last resort.
 
 `~/.codex/sessions/**/*.jsonl` rows show cached tokens, hit-rate, and an
 **estimated** eviction countdown, marked with a `~`. OpenAI's implicit caching
-has no contractual TTL, so the window was measured from this account's own
-history (1,019 call pairs): hits are ~100% up to 10 minutes idle, roughly
-two-in-three between 10 and 30 minutes, and gone by 2 hours — matching OpenAI's
-"5–10 minutes typical, up to one hour" guidance. The countdown runs against the
-reliable 10-minute window (`AI_CACHE_CODEX_TTL_SECONDS`); past it the row says
-"likely evicted" rather than pretending certainty, and estimated TTLs shape the
-display but never fire notifications.
+has no contractual TTL, so nothing past the reliable window is knowable — only
+likely. Codex rows therefore use a traffic light instead of claude's
+deterministic fire/snow:
+
+- 🟢 inside the measured reliably-warm window, with a `~` countdown
+- 🟡 the uncertain zone — "maybe still warm (~70%)", the measured odds
+- 🔴 past the longest survival ever observed — "likely evicted"
+
+The curve is **self-calibrated from this machine's own rollout history**: every
+rollout records (idle gap before a call → did it still hit the cache), and the
+fit derives the reliable window (bucketed hit-share ≥ 80%), the longest observed
+survival, and the hit-share in between. CacheBar.app remeasures once per launch
+(`--calibrate`, cached in `~/.claude/.ai-cache-bar-codex.json`, refreshed at
+most daily otherwise; falls back to 10 min / 1 h below 100 usable pairs). On the
+account this was built against, 1,019 pairs gave: ~100% hits up to 10 minutes
+idle, ~70% between 10 and ~43 minutes, gone past that — matching OpenAI's "5–10
+minutes typical, up to one hour" guidance. `AI_CACHE_CODEX_TTL_SECONDS`
+overrides the reliable window; estimated states shape the display but never
+fire notifications.
 
 A resume spawns a new rollout file, so rows dedupe by the `session_meta` head
 line's `session_id`. Chat names (auto-generated and user renames alike) live in

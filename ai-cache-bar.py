@@ -47,12 +47,6 @@ import time
 
 TTL = int(os.environ.get("AI_CACHE_TTL_SECONDS", "3600"))
 WARN = int(os.environ.get("AI_CACHE_WARN_SECONDS", "600"))
-# Codex/OpenAI implicit caching has no contractual TTL. Measured on this account
-# (1019 call pairs, 2026-08-28): hits are ~100% up to 10 min idle, roughly
-# two-in-three between 10 and 30 min, gone by 2 h — matching OpenAI's "5-10
-# minutes typical, up to one hour" guidance. 600s is the reliably-warm window;
-# past it the row turns cold as "likely evicted", hedged because it is a guess.
-CODEX_TTL = int(os.environ.get("AI_CACHE_CODEX_TTL_SECONDS", "600"))
 LOOKBACK = int(os.environ.get("AI_CACHE_LOOKBACK_MIN", "240")) * 60
 TAIL_BYTES = int(os.environ.get("AI_CACHE_TAIL_BYTES", str(256 * 1024)))
 MAX_ROWS = int(os.environ.get("AI_CACHE_MAX_ROWS", "10"))
@@ -61,6 +55,7 @@ NOTIFY_MAX_AGE = int(os.environ.get("AI_CACHE_NOTIFY_MAX_AGE", "7200"))
 HOME = os.path.expanduser("~")
 STATE = os.path.join(HOME, ".claude", ".ai-cache-bar-state.json")
 TITLE_CACHE = os.path.join(HOME, ".claude", ".ai-cache-bar-titles.json")
+CODEX_CAL = os.path.join(HOME, ".claude", ".ai-cache-bar-codex.json")
 WORKTREES = os.path.join(HOME, "Library", "Application Support", "Claude",
                         "git-worktrees.json")
 
@@ -431,6 +426,93 @@ def claude_sessions(now, titles):
     return list(out.values())
 
 
+def _measure_codex():
+    """Fit the codex eviction curve from this account's own rollout history.
+
+    OpenAI implicit caching has no contractual TTL, but every rollout records
+    (idle gap before a call, whether that call still hit the cache). From those
+    pairs: warm_s = the largest idle gap the cache reliably survives (bucketed
+    hit-share stays >= 80%), dead_s = the longest survival ever observed, and
+    maybe_pct = the hit-share in the zone between them. Returns None when the
+    history is too thin to say anything.
+    """
+    sessions = {}
+    for f in glob.iglob(os.path.join(HOME, ".codex", "sessions", "**", "*.jsonl"),
+                        recursive=True):
+        sid = None
+        try:
+            with open(f, "rb") as fh:
+                for line in fh:
+                    if b"token_count" not in line and b"session_meta" not in line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except ValueError:
+                        continue
+                    if e.get("type") == "session_meta":
+                        meta = e.get("payload") or {}
+                        sid = meta.get("session_id") or meta.get("id")
+                        continue
+                    payload = e.get("payload") or {}
+                    if payload.get("type") != "token_count":
+                        continue
+                    usage = (payload.get("info") or {}).get("last_token_usage")
+                    at = epoch(e.get("timestamp", ""))
+                    if not usage or at is None:
+                        continue
+                    sessions.setdefault(sid or f, []).append(
+                        (at, usage.get("input_tokens") or 0,
+                         usage.get("cached_input_tokens") or 0))
+        except OSError:
+            continue
+    pairs = []
+    for turns in sessions.values():
+        turns.sort()
+        for i in range(1, len(turns)):
+            at, inp, cached = turns[i]
+            gap = at - turns[i - 1][0]
+            if inp >= 5000 and gap >= 1:  # too small a prompt proves nothing
+                pairs.append((gap, cached / float(inp)))
+    hits = [g for g, h in pairs if h > 0.5]
+    misses = [g for g, h in pairs if h <= 0.5]
+    if len(pairs) < 100 or not hits or not misses:
+        return None
+    edges = [0, 60, 120, 300, 600, 900, 1800, 3600, 7200]
+    warm = 300  # never claim reliability below what OpenAI documents as typical
+    for lo, hi in zip(edges, edges[1:]):
+        bucket = [h for g, h in pairs if lo <= g < hi]
+        if len(bucket) < 3:
+            continue  # no evidence either way — keep extending
+        if sum(1 for h in bucket if h > 0.5) / float(len(bucket)) < 0.8:
+            break
+        warm = max(warm, hi)
+    dead = min(max(int(max(hits)) + 60, warm * 2), 7200)
+    mid = [h for g, h in pairs if warm <= g < dead]
+    maybe = (int(round(100.0 * sum(1 for h in mid if h > 0.5) / len(mid)))
+             if mid else 50)
+    return {"warm_s": warm, "dead_s": dead, "maybe_pct": maybe,
+            "pairs": len(pairs)}
+
+
+def codex_calibration(now, force=False):
+    """Cached eviction-curve fit; remeasured at most daily (or on --calibrate,
+    which CacheBar.app fires once per launch)."""
+    cal = None if force else load_json(CODEX_CAL, None)
+    if not (cal and now - cal.get("computed_at", 0) < 86400):
+        cal = _measure_codex() or {"warm_s": 600, "dead_s": 3600,
+                                   "maybe_pct": 50, "pairs": 0, "default": True}
+        cal["computed_at"] = int(now)
+        try:
+            with open(CODEX_CAL, "w") as fh:
+                json.dump(cal, fh)
+        except (IOError, OSError):
+            pass
+    env = os.environ.get("AI_CACHE_CODEX_TTL_SECONDS")
+    if env:
+        cal = dict(cal, warm_s=int(env))
+    return cal
+
+
 def codex_titles():
     """id -> thread_name from ~/.codex/session_index.jsonl (last entry wins).
 
@@ -470,6 +552,7 @@ def codex_sessions(now):
     # the rollouts; the cwd-based label is the fallback for unnamed chats.
     out = {}
     titles = codex_titles()
+    cal = codex_calibration(now)
     pat = os.path.join(HOME, ".codex", "sessions", "**", "*.jsonl")
     for path in recent_files(pat, now):
         for line in reversed(tail_lines(path)):
@@ -493,6 +576,15 @@ def codex_sessions(now):
             branch = git.get("branch") or ""
             inp = usage.get("input_tokens") or 0
             cached = usage.get("cached_input_tokens") or 0
+            age = int(now - at)
+            # Nothing past warm_s is knowable, only likely — hence the traffic
+            # light instead of claude's deterministic warm/cold.
+            if age < cal["warm_s"]:
+                state = "est_warm"
+            elif age < cal["dead_s"]:
+                state = "uncertain"
+            else:
+                state = "est_gone"
             row = {
                 "tool": "codex",
                 "session": sid,
@@ -501,8 +593,10 @@ def codex_sessions(now):
                 + (("@" + branch) if branch else ""),
                 "model": "codex",
                 "cwd": cwd,
-                "age": int(now - at),
-                "left": int(CODEX_TTL - (now - at)),
+                "age": age,
+                "left": int(cal["warm_s"] - age),
+                "state": state,
+                "maybe_pct": cal["maybe_pct"],
                 "cached": cached,
                 "context": inp,
                 "hit_rate": (int(round(100.0 * cached / inp)) if inp else 0),
@@ -534,17 +628,19 @@ def collect():
     rows = [r for r in rows
             if not r.get("app_session") or by_app[r["app_session"]] is r]
     for r in rows:
-        if not r["ttl_known"]:
-            r["state"] = "untracked"
-        elif r["left"] <= 0:
-            r["state"] = "cold"
-        elif r["left"] < (max(60, CODEX_TTL // 4) if r.get("ttl_estimate") else WARN):
-            r["state"] = "expiring"
-        else:
-            r["state"] = "warm"
+        if "state" not in r:
+            if not r["ttl_known"]:
+                r["state"] = "untracked"
+            elif r["left"] <= 0:
+                r["state"] = "cold"
+            elif r["left"] < WARN:
+                r["state"] = "expiring"
+            else:
+                r["state"] = "warm"
         r["display"] = r.get("title") or r["label"]
     # live sessions first, most urgent at the top; then the cold ones by recency
-    rows.sort(key=lambda r: (0, r["left"]) if r["state"] in ("warm", "expiring")
+    rows.sort(key=lambda r: (0, r["left"])
+              if r["state"] in ("warm", "expiring", "est_warm")
               else (1, r["age"]))
     if titles != before:
         try:
@@ -570,21 +666,25 @@ def kt(n):
     return ("%dk" % (n // 1000)) if n >= 1000 else str(n)
 
 
-ICON = {"warm": "🔥", "expiring": "⚠️", "cold": "❄️", "untracked": "🟡"}
+ICON = {"warm": "🔥", "expiring": "⚠️", "cold": "❄️", "untracked": "🟡",
+        "est_warm": "🟢", "uncertain": "🟡", "est_gone": "🔴"}
 
 
 def describe(r):
+    hit = (" · %d%% hit" % r["hit_rate"]) if r.get("hit_rate") is not None else ""
     if r["state"] == "untracked":
         return "%s cached · %d%% hit · idle %s" % (
             kt(r["cached"]), r.get("hit_rate", 0), hms(r["age"]))
-    est = r.get("ttl_estimate")
-    hit = (" · %d%% hit" % r["hit_rate"]) if r.get("hit_rate") is not None else ""
+    if r["state"] == "est_warm":
+        return "~%s left · %s%s" % (hms(r["left"]), kt(r["cached"]), hit)
+    if r["state"] == "uncertain":
+        return "maybe still warm (~%d%%) · idle %s%s" % (
+            r.get("maybe_pct", 50), hms(r["age"]), hit)
+    if r["state"] == "est_gone":
+        return "likely evicted — idle %s%s" % (hms(r["age"]), hit)
     if r["state"] == "cold":
-        if est:
-            return "likely evicted — idle %s%s" % (hms(r["age"]), hit)
         return "cold %s — rewrites %s" % (hms(r["age"]), kt(r["cached"]))
-    return "%s%s left · %s%s" % ("~" if est else "", hms(r["left"]),
-                                 kt(r["cached"]), hit)
+    return "%s left · %s" % (hms(r["left"]), kt(r["cached"]))
 
 
 def budget_line(b):
@@ -627,15 +727,16 @@ def render_swiftbar(rows, b=None):
         print("🫥")
     else:
         t = tracked[0]
-        if t["state"] == "cold":
-            print("❄️ %s | color=#8899aa" % hms(t["age"]))
+        if t["state"] in ("cold", "est_gone", "uncertain"):
+            print("%s %s | color=#8899aa" % (ICON[t["state"]], hms(t["age"])))
         else:
             colour = " | color=orange" if t["state"] == "expiring" else ""
             print("%s %s%s%s" % (ICON[t["state"]],
                                  "~" if t.get("ttl_estimate") else "",
                                  hms(t["left"]), colour))
     print("---")
-    warm = len([r for r in tracked if r["state"] in ("warm", "expiring")])
+    warm = len([r for r in tracked
+                if r["state"] in ("warm", "expiring", "est_warm")])
     print("Prompt cache · %d warm / %d recent | size=11 color=gray" % (warm, len(rows)))
     for r in rows[:MAX_ROWS]:
         print("%s %s  ·  %s" % (ICON[r["state"]], r["display"][:46], describe(r)))
@@ -723,7 +824,7 @@ def render_notify(rows, b=None):
 def main():
     mode = "swiftbar"
     for a in sys.argv[1:]:
-        if a in ("--swiftbar", "--notify", "--text", "--json"):
+        if a in ("--swiftbar", "--notify", "--text", "--json", "--calibrate"):
             mode = a[2:]
         elif a in ("-h", "--help"):
             print(__doc__)
@@ -731,6 +832,10 @@ def main():
         else:
             sys.stderr.write("unknown arg: %s\n" % a)
             return 2
+    if mode == "calibrate":
+        json.dump(codex_calibration(time.time(), force=True), sys.stdout, indent=2)
+        print()
+        return 0
     rows = collect()
     b = budget(rows, time.time())
     if mode == "json":
