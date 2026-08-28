@@ -271,16 +271,18 @@ final class Monitor: ObservableObject {
             let was = lastState[row.session] ?? "warm"
             lastState[row.session] = row.state
             guard seeded, was != row.state, notificationsEnabled else { continue }
+            // The chat title is the headline — a "Cache expiring:" prefix pushes
+            // long titles out of the banner's single bold line.
             if row.state == "expiring" {
                 Notifier.shared.post(
-                    title: "Cache expiring: \(row.display)",
-                    body: "\(hms(row.left)) left on \(kt(row.cached)) cached. Any message refreshes the hour.",
+                    title: row.display,
+                    body: "Cache expiring — \(hms(row.left)) left on \(kt(row.cached)) cached. Any message refreshes the hour.",
                     transcript: row.path,
                     group: "cachebar-\(row.session)")
             } else if row.state == "cold" {
                 Notifier.shared.post(
-                    title: "Cache cold: \(row.display)",
-                    body: "Next turn rewrites \(kt(row.cached)) at 1.25x instead of reading at 0.1x.",
+                    title: row.display,
+                    body: "Cache went cold — next turn rewrites \(kt(row.cached)) at 1.25x instead of reading at 0.1x.",
                     transcript: row.path,
                     group: "cachebar-\(row.session)")
             }
@@ -288,10 +290,14 @@ final class Monitor: ObservableObject {
         if let b = newBudget {
             let tight = b.would_exhaust_5h
             if seeded, tight, !lastBudgetTight, notificationsEnabled {
+                let cold = rows.filter { $0.ttl_known && $0.state == "cold" }.map(\.display)
+                let who = cold.isEmpty ? b.detail
+                    : "Cold: " + cold.prefix(2).joined(separator: " · ")
+                      + (cold.count > 2 ? " +\(cold.count - 2) more" : "")
                 Notifier.shared.post(
                     title: "Compacting everything would exhaust your 5h limit",
                     body: "\(b.chats) chats ≈ \(String(format: "%.1f", b.compaction_pct_5h))% "
-                        + "but only \(b.left_pct_5h.map(String.init) ?? "?")% left. \(b.detail)",
+                        + "but only \(b.left_pct_5h.map(String.init) ?? "?")% left. \(who)",
                     group: "cachebar-budget")
             }
             lastBudgetTight = tight

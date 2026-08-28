@@ -563,10 +563,12 @@ def render_swiftbar(rows, b=None):
     print("Refresh | refresh=true")
 
 
-def notify(title, msg):
+def notify(title, msg, group="ai-cache-bar"):
     if os.path.exists("/opt/homebrew/bin/terminal-notifier"):
+        # a group per session, so a session's later notification replaces its own
+        # earlier one instead of clobbering a different session's
         cmd = ["/opt/homebrew/bin/terminal-notifier", "-title", title,
-               "-message", msg, "-group", "ai-cache-bar"]
+               "-message", msg, "-group", group]
     else:
         cmd = ["/usr/bin/osascript", "-e", "display notification %s with title %s"
                % (json.dumps(msg), json.dumps(title))]
@@ -587,24 +589,33 @@ def render_notify(rows, b=None):
         flag = "tight" if b["would_exhaust_5h"] else "ok"
         current[BUDGET_KEY] = flag
         if flag == "tight" and prev.get(BUDGET_KEY, "ok") != "tight":
+            cold = [r["display"] for r in rows
+                    if r["tool"] == "claude" and r["state"] == "cold"]
+            who = ("Cold: " + " \u00b7 ".join(cold[:2])
+                   + (" +%d more" % (len(cold) - 2) if len(cold) > 2 else "")
+                   ) if cold else budget_detail(b)
             notify("Compacting everything would exhaust your 5h limit",
                    "%d chats \u2248 %s%% but only %s%% left. %s"
-                   % (b["chats"], b["compaction_pct_5h"], b["left_pct_5h"],
-                      budget_detail(b)))
+                   % (b["chats"], b["compaction_pct_5h"], b["left_pct_5h"], who),
+                   group="ai-cache-bar-budget")
     for r in rows:
         if not r["ttl_known"] or r["age"] > NOTIFY_MAX_AGE:
             continue  # only sessions you plausibly still have open
         current[r["session"]] = r["state"]
         if prev.get(r["session"], "warm") == r["state"]:
             continue
+        # The chat title is the headline — a "Cache expiring:" prefix pushes
+        # long titles out of the banner's single bold line.
         if r["state"] == "expiring":
-            notify("Cache expiring: %s" % r["display"],
-                   "%s left on %s cached. Any message refreshes the hour."
-                   % (hms(r["left"]), kt(r["cached"])))
+            notify(r["display"],
+                   "Cache expiring \u2014 %s left on %s cached. Any message refreshes the hour."
+                   % (hms(r["left"]), kt(r["cached"])),
+                   group="ai-cache-bar-" + r["session"])
         elif r["state"] == "cold":
-            notify("Cache cold: %s" % r["display"],
-                   "Next turn rewrites %s at 1.25x instead of reading at 0.1x."
-                   % kt(r["cached"]))
+            notify(r["display"],
+                   "Cache went cold \u2014 next turn rewrites %s at 1.25x instead of reading at 0.1x."
+                   % kt(r["cached"]),
+                   group="ai-cache-bar-" + r["session"])
     try:
         with open(STATE, "w") as fh:
             json.dump(current, fh)
