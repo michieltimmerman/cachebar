@@ -12,8 +12,9 @@ Providers, using only data these tools already write locally:
           machine: every transcript reports ephemeral_1h_input_tokens, never 5m).
           Each turn refreshes the TTL, so deadline = last turn + 1h. Exact countdown.
   codex   ~/.codex/sessions/**/*.jsonl   — last_token_usage.cached_input_tokens per
-          turn. OpenAI implicit caching has no documented TTL and no client control,
-          so this reports hit-rate and idle time only, never a countdown.
+          turn, one row per session_id (a resume spawns a new rollout file, so files
+          must be deduped). OpenAI implicit caching has no documented TTL and no
+          client control, so this reports hit-rate and idle time only, no countdown.
 
 Chat titles come from the transcript's own "custom-title" / "ai-title" entries
 (a custom title wins), cached in .ai-cache-bar-titles.json so a full-file scan
@@ -209,6 +210,8 @@ CACHE_1H_WEIGHT = 1.6
 MODEL_WEIGHTS = (("fable", 2.0), ("opus", 1.0), ("sonnet", 0.4), ("haiku", 0.2))
 # A compaction emits one summary; output is the expensive term at 14x.
 COMPACT_SUMMARY_OUT = int(os.environ.get("AI_CACHE_COMPACT_OUT", "4000"))
+# Smallest prefix rewrite worth a "you just paid the cold tax" notification.
+REWRITE_MIN = int(os.environ.get("AI_CACHE_REWRITE_MIN", "25000"))
 
 
 def model_weight(model):
@@ -352,15 +355,20 @@ def claude_sessions(now, titles):
     # the session you are typing into, so they stay out of the menu bar.
     for path in recent_files(pat, now, skip="/subagents/"):
         tail = tail_lines(path)
-        last = None
+        last = prev = None
         for line in reversed(tail):
             try:
                 e = json.loads(line)
             except ValueError:
                 continue
             usage = (e.get("message") or {}).get("usage")
-            if usage and e.get("requestId") and not e.get("isSidechain"):
+            if not (usage and e.get("requestId") and not e.get("isSidechain")):
+                continue
+            if last is None:
                 last = (e, usage)
+            elif e["requestId"] != last[0]["requestId"]:
+                # reversed scan, so this is the final entry of the turn before
+                prev = (e, usage)
                 break
         if not last:
             continue
@@ -371,13 +379,28 @@ def claude_sessions(now, titles):
         sid = e.get("sessionId") or path
         cwd = e.get("cwd") or ""
         branch = e.get("gitBranch") or ""
+        model = (e.get("message") or {}).get("model") or "?"
         app_session = app_session_for(cwd, owners)
+        # The cold-tax signature: the previous turn held a real cached prefix, the
+        # gap outlived the TTL, and this turn rewrote instead of reading.
+        rewrote = rewrite_at = rewrite_gap = rewrite_pct = None
+        if prev:
+            p_at = epoch(prev[0].get("timestamp", ""))
+            p_tot = (prev[1].get("cache_read_input_tokens") or 0) + (
+                prev[1].get("cache_creation_input_tokens") or 0)
+            wrote = usage.get("cache_creation_input_tokens") or 0
+            read = usage.get("cache_read_input_tokens") or 0
+            if (p_at is not None and p_tot > 5000 and wrote >= REWRITE_MIN
+                    and read < p_tot * 0.5 and at - p_at >= TTL):
+                rewrote, rewrite_at, rewrite_gap = wrote, int(at), int(at - p_at)
+                rewrite_pct = round(model_weight(model) * wrote * CACHE_1H_WEIGHT
+                                    / FIVE_HOUR_PER_PCT, 1)
         row = {
             "tool": "claude",
             "session": sid,
             "title": session_title(path, sid, tail, titles),
             "label": (os.path.basename(cwd) or "?") + (("@" + branch) if branch else ""),
-            "model": (e.get("message") or {}).get("model") or "?",
+            "model": model,
             "cwd": cwd,
             "age": int(now - at),
             "left": int(TTL - (now - at)),
@@ -388,6 +411,11 @@ def claude_sessions(now, titles):
             + (usage.get("cache_read_input_tokens") or 0)
             + (usage.get("cache_creation_input_tokens") or 0),
             "ttl_known": True,
+            "rewrote": rewrote,
+            "rewrite_at": rewrite_at,
+            "rewrite_age": (int(now - rewrite_at) if rewrite_at else None),
+            "rewrite_gap": rewrite_gap,
+            "rewrite_pct_5h": rewrite_pct,
             "app_session": app_session,
             "path": path,
         }
@@ -396,8 +424,24 @@ def claude_sessions(now, titles):
     return list(out.values())
 
 
+def _codex_meta(path):
+    """session_meta from a rollout file's first line ({} when absent)."""
+    try:
+        with open(path, "rb") as fh:
+            e = json.loads(fh.readline())
+    except (OSError, ValueError):
+        return {}
+    if e.get("type") != "session_meta":
+        return {}
+    return e.get("payload") or {}
+
+
 def codex_sessions(now):
-    out = []
+    # Codex starts a NEW rollout file on every resume, all carrying the same
+    # session_id in their session_meta head line — so dedupe by that id or one
+    # chat shows up once per resume. There is no title concept; the label comes
+    # from the session's cwd, like an untitled claude row.
+    out = {}
     pat = os.path.join(HOME, ".codex", "sessions", "**", "*.jsonl")
     for path in recent_files(pat, now):
         for line in reversed(tail_lines(path)):
@@ -414,15 +458,21 @@ def codex_sessions(now):
             at = epoch(e.get("timestamp", ""))
             if at is None:
                 break
+            meta = _codex_meta(path)
+            sid = meta.get("session_id") or meta.get("id") or os.path.basename(path)
+            cwd = meta.get("cwd") or ""
+            git = meta.get("git") if isinstance(meta.get("git"), dict) else {}
+            branch = git.get("branch") or ""
             inp = usage.get("input_tokens") or 0
             cached = usage.get("cached_input_tokens") or 0
-            out.append({
+            row = {
                 "tool": "codex",
-                "session": os.path.basename(path),
+                "session": sid,
                 "title": None,
-                "label": "codex " + os.path.basename(path)[8:18],
+                "label": "codex " + (os.path.basename(cwd) or "?")
+                + (("@" + branch) if branch else ""),
                 "model": "codex",
-                "cwd": "",
+                "cwd": cwd,
                 "age": int(now - at),
                 "left": 0,
                 "cached": cached,
@@ -431,9 +481,11 @@ def codex_sessions(now):
                 "ttl_known": False,
                 "app_session": None,
                 "path": path,
-            })
+            }
+            if sid not in out or out[sid]["age"] > row["age"]:
+                out[sid] = row
             break
-    return out
+    return list(out.values())
 
 
 def collect():
@@ -602,6 +654,15 @@ def render_notify(rows, b=None):
         if not r["ttl_known"] or r["age"] > NOTIFY_MAX_AGE:
             continue  # only sessions you plausibly still have open
         current[r["session"]] = r["state"]
+        # Cold tax already paid: a fresh prefix rewrite in this session.
+        if r.get("rewrite_at"):
+            key = "rewrite:" + r["session"]
+            current[key] = r["rewrite_at"]
+            if prev.get(key) != r["rewrite_at"] and (r.get("rewrite_age") or 0) <= 1800:
+                notify(r["display"],
+                       "Rewrote %s cached tokens after %s idle \u2014 \u2248%s%% of the 5h limit."
+                       % (kt(r["rewrote"]), hms(r["rewrite_gap"]), r["rewrite_pct_5h"]),
+                       group="ai-cache-bar-rewrite-" + r["session"])
         if prev.get(r["session"], "warm") == r["state"]:
             continue
         # The chat title is the headline — a "Cache expiring:" prefix pushes

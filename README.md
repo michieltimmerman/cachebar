@@ -19,8 +19,10 @@ compacting 5 chats ≈ 13.3% of the 5h limit · 85% left
 ```
 
 Notifications fire when a session is about to go cold (default: 10 minutes
-before), when it has gone cold, and once when compacting all open chats would no
-longer fit in what's left of the five-hour limit.
+before), when it has gone cold, when a turn in a cold chat just paid the tax —
+"Rewrote 390k cached tokens after 1h57m idle — ≈7.0% of the 5h limit" — and once
+when compacting all open chats would no longer fit in what's left of the
+five-hour limit.
 
 ## Why
 
@@ -86,6 +88,7 @@ All knobs are environment variables read by `ai-cache-bar.py`:
 | `AI_CACHE_5H_PER_PCT` | `179000` | Weighted tokens per 1% of the five-hour limit (see calibration) |
 | `AI_CACHE_7D_PER_PCT` | `1500000` | Same for the seven-day limit (much less certain) |
 | `AI_CACHE_COMPACT_OUT` | `4000` | Assumed summary size of one compaction |
+| `AI_CACHE_REWRITE_MIN` | `25000` | Smallest prefix rewrite worth a cold-tax notification |
 | `CACHEBAR_SCRIPT` | *(bundled)* | App only: override which script the app polls |
 
 ## Data sources

@@ -11,8 +11,8 @@
 // ("Notifications are not allowed for this application") even signed with an Apple
 // Development identity, registered with LaunchServices, under a fresh bundle id.
 // Local notifications need a Developer ID / notarized app. So delivery goes through
-// terminal-notifier, which keeps click-to-open via -execute; the native path
-// switches on by itself if this ever gets a Developer ID signature.
+// terminal-notifier; the native path switches on by itself if this ever gets a
+// Developer ID signature.
 import ServiceManagement
 import SwiftUI
 import UserNotifications
@@ -30,7 +30,11 @@ struct Session: Codable, Identifiable {
     let ttl_known: Bool
     let state: String
     let hit_rate: Int?
-    let path: String
+    let rewrote: Int?
+    let rewrite_at: Int?
+    let rewrite_age: Int?
+    let rewrite_gap: Int?
+    let rewrite_pct_5h: Double?
 
     var id: String { session }
 
@@ -103,13 +107,6 @@ func hms(_ seconds: Int) -> String {
 
 func kt(_ n: Int) -> String { n >= 1000 ? "\(n / 1000)k" : "\(n)" }
 
-/// No claude:// deep link can safely focus an existing chat (see README.md), so
-/// "opening" a session reveals its transcript in Finder.
-func reveal(transcript: String) {
-    guard !transcript.isEmpty else { return }
-    NSWorkspace.shared.selectFile(transcript, inFileViewerRootedAtPath: "")
-}
-
 // MARK: - Notifications
 
 final class Notifier: NSObject, UNUserNotificationCenterDelegate {
@@ -135,34 +132,27 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    func post(title: String, body: String, transcript: String = "",
-              group: String = "cachebar") {
+    func post(title: String, body: String, group: String = "cachebar") {
         if useNative {
             let content = UNMutableNotificationContent()
             content.title = title
             content.body = body
-            content.userInfo = ["transcript": transcript]
             let request = UNNotificationRequest(identifier: UUID().uuidString,
                                                content: content, trigger: nil)
             UNUserNotificationCenter.current().add(request)
         } else {
-            postViaFallback(title: title, body: body, transcript: transcript, group: group)
+            postViaFallback(title: title, body: body, group: group)
         }
     }
 
     private func postViaFallback(title: String, body: String,
-                                transcript: String = "", group: String = "cachebar") {
+                                group: String = "cachebar") {
         let proc = Process()
         if FileManager.default.isExecutableFile(atPath: fallback) {
             proc.executableURL = URL(fileURLWithPath: fallback)
             // -group per session, so one session's later notification replaces its
             // own earlier one instead of clobbering a different session's.
-            var args = ["-title", title, "-message", body, "-group", group]
-            // -execute keeps click-to-reveal working without UNUserNotificationCenter.
-            if !transcript.isEmpty {
-                args += ["-execute", "/usr/bin/open -R \"\(transcript)\""]
-            }
-            proc.arguments = args
+            proc.arguments = ["-title", title, "-message", body, "-group", group]
         } else {
             let esc = { (s: String) in s.replacingOccurrences(of: "\"", with: "\\\"") }
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
@@ -170,15 +160,6 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
                 "display notification \"\(esc(body))\" with title \"\(esc(title))\""]
         }
         try? proc.run()
-    }
-
-    // Tapping a notification reveals the transcript it is about.
-    func userNotificationCenter(_ center: UNUserNotificationCenter,
-                               didReceive response: UNNotificationResponse,
-                               withCompletionHandler completion: @escaping () -> Void) {
-        let info = response.notification.request.content.userInfo
-        reveal(transcript: info["transcript"] as? String ?? "")
-        completion()
     }
 
     // LSUIElement apps are never "frontmost" in the usual sense; show banners anyway.
@@ -202,6 +183,7 @@ final class Monitor: ObservableObject {
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     private var lastState: [String: String] = [:]
+    private var lastRewriteAt: [String: Int] = [:]
     private var lastBudgetTight = false
     /// The first poll only records state. Without this, launching while sessions are
     /// already cold fires a notification per session for news you did not ask for.
@@ -268,6 +250,18 @@ final class Monitor: ObservableObject {
         }
 
         for row in rows where row.ttl_known && row.age < 7200 {
+            // Cold tax already paid: a fresh prefix rewrite in this session.
+            if let wrote = row.rewrote, let at = row.rewrite_at {
+                let isNew = lastRewriteAt[row.session] != at
+                lastRewriteAt[row.session] = at
+                if seeded, isNew, (row.rewrite_age ?? .max) <= 1800, notificationsEnabled {
+                    Notifier.shared.post(
+                        title: row.display,
+                        body: "Rewrote \(kt(wrote)) cached tokens after \(hms(row.rewrite_gap ?? 0)) idle — "
+                            + "≈\(String(format: "%.1f", row.rewrite_pct_5h ?? 0))% of the 5h limit.",
+                        group: "cachebar-rewrite-\(row.session)")
+                }
+            }
             let was = lastState[row.session] ?? "warm"
             lastState[row.session] = row.state
             guard seeded, was != row.state, notificationsEnabled else { continue }
@@ -277,13 +271,11 @@ final class Monitor: ObservableObject {
                 Notifier.shared.post(
                     title: row.display,
                     body: "Cache expiring — \(hms(row.left)) left on \(kt(row.cached)) cached. Any message refreshes the hour.",
-                    transcript: row.path,
                     group: "cachebar-\(row.session)")
             } else if row.state == "cold" {
                 Notifier.shared.post(
                     title: row.display,
                     body: "Cache went cold — next turn rewrites \(kt(row.cached)) at 1.25x instead of reading at 0.1x.",
-                    transcript: row.path,
                     group: "cachebar-\(row.session)")
             }
         }
@@ -306,14 +298,11 @@ final class Monitor: ObservableObject {
     }
 
     /// Verifies delivery end to end, and triggers the authorization prompt on a
-    /// first run. Carries a real transcript so tapping it also tests the reveal.
+    /// first run.
     func sendTestNotification() {
-        let target = sessions.first
         Notifier.shared.post(
             title: "CacheBar test notification",
-            body: target.map { "Tap to reveal “\($0.display)”." }
-                ?? "Delivery works. No sessions right now.",
-            transcript: target?.path ?? "")
+            body: "Delivery works.")
     }
 
     func setLaunchAtLogin(_ on: Bool) {
@@ -343,10 +332,10 @@ struct CacheBarApp: App {
         MenuBarExtra {
             Text("Prompt cache · \(monitor.warmCount) warm / \(monitor.sessions.count) recent")
             Divider()
+            // Rows are information, not actions — nothing is safe to open on
+            // click (README.md: deep links), so they are plain text.
             ForEach(monitor.sessions) { s in
-                Button("\(s.icon)  \(s.display)  ·  \(s.detail)") {
-                    reveal(transcript: s.path)
-                }
+                Text("\(s.icon)  \(s.display)  ·  \(s.detail)")
             }
             if let b = monitor.budget {
                 Divider()
