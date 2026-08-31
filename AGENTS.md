@@ -97,6 +97,17 @@ Verification patterns that work (and were used to build this):
   `isSidechain: true` = subagent (own cache prefix — excluded from session
   rows, but ~34% of real token spend, so **included** in plan calibration).
   `model: "<synthetic>"` entries carry zero usage — skip.
+- **A compaction writes no usage entry.** `/compact` appends a
+  `{"isCompactSummary": true}` user entry (and a `model: "<synthetic>"`
+  assistant entry with all-zero usage and **no `requestId`**, which the
+  requestId filter already drops). So between the compaction and the next real
+  turn, the newest usage entry is the **pre-compaction** turn: reporting it
+  gives the old prefix size and a countdown anchored before the compaction
+  (observed: 13 min stale, 318k instead of 75k) and inflates the budget line.
+  Hence the `compacted` state — track the newest `isCompactSummary` timestamp
+  and compare it to the last usage entry's. The same marker also suppresses the
+  cold-tax detector: the prefix rewrite on the first post-compaction turn is
+  the compaction's doing, not idleness.
 - **Transcripts are multi-MB.** The collector must stay on `tail_lines()`
   (bounded reads); full-file scans are allowed only once per session for
   titles, cached in `~/.claude/.ai-cache-bar-titles.json`.

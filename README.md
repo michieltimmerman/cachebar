@@ -100,7 +100,10 @@ All knobs are environment variables read by `ai-cache-bar.py`:
 
 - `~/.claude/projects/**/*.jsonl` — Claude Code transcripts. Last main-chain
   entry's `message.usage` gives cache size and turn time; `custom-title` /
-  `ai-title` entries give the chat's name (custom wins). Subagent transcripts
+  `ai-title` entries give the chat's name (custom wins). A compaction writes no
+  usage of its own, so an `isCompactSummary` entry newer than the last turn
+  marks the chat 🧹 `compacted` — its old prefix is gone from the conversation
+  and the summary that replaced it isn't cached until the next turn. Subagent transcripts
   (`*/subagents/*`) have their own cache prefix and are excluded from rows.
 - `~/Library/Application Support/Claude/plan-usage-history.json` — the desktop
   app's ~5-minute samples of `{"fh": pct, "sd": pct}`: five-hour and seven-day
