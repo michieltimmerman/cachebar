@@ -50,11 +50,17 @@ struct Session: Codable, Identifiable {
         case "est_warm": return "🟢"
         case "uncertain": return "🟡"
         case "est_gone": return "🔴"
+        case "compacted": return "🧹"
         default: return "🟡"
         }
     }
 
     var detail: String {
+        // Compacted chats are ttl_known == false too, but their story is the
+        // compaction, not an untracked cache.
+        if state == "compacted" {
+            return "compacted \(hms(age)) ago — next turn writes a fresh prefix"
+        }
         if !ttl_known {
             return "\(kt(cached)) cached · \(hit_rate ?? 0)% hit · idle \(hms(age))"
         }

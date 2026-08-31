@@ -356,12 +356,17 @@ def claude_sessions(now, titles):
     # the session you are typing into, so they stay out of the menu bar.
     for path in recent_files(pat, now, skip="/subagents/"):
         tail = tail_lines(path)
-        last = prev = None
+        last = prev = compact_at = None
         for line in reversed(tail):
             try:
                 e = json.loads(line)
             except ValueError:
                 continue
+            # A compaction replaces the whole prefix but writes no usage of its
+            # own, so the newest one has to be tracked separately. Reversed scan,
+            # so the first hit is the newest.
+            if e.get("isCompactSummary") and compact_at is None:
+                compact_at = epoch(e.get("timestamp", ""))
             usage = (e.get("message") or {}).get("usage")
             if not (usage and e.get("requestId") and not e.get("isSidechain")):
                 continue
@@ -391,7 +396,12 @@ def claude_sessions(now, titles):
                 prev[1].get("cache_creation_input_tokens") or 0)
             wrote = usage.get("cache_creation_input_tokens") or 0
             read = usage.get("cache_read_input_tokens") or 0
-            if (p_at is not None and p_tot > 5000 and wrote >= REWRITE_MIN
+            # A compaction between the two turns rewrites the prefix by design;
+            # that is not the cold tax, so it must not be reported as one.
+            by_compaction = (compact_at is not None and p_at is not None
+                             and compact_at > p_at)
+            if (p_at is not None and not by_compaction
+                    and p_tot > 5000 and wrote >= REWRITE_MIN
                     and read < p_tot * 0.5 and at - p_at >= TTL):
                 rewrote, rewrite_at, rewrite_gap = wrote, int(at), int(at - p_at)
                 rewrite_pct = round(model_weight(model) * wrote * CACHE_1H_WEIGHT
@@ -421,6 +431,19 @@ def claude_sessions(now, titles):
             "app_session": app_session,
             "path": path,
         }
+        if compact_at is not None and compact_at > at:
+            # Compacted since the last turn: the old prefix is gone from the
+            # conversation (so reporting its size and TTL is doubly wrong) and
+            # the summary that replaced it is not cached until the next turn.
+            row.update({
+                "state": "compacted",
+                "age": int(now - compact_at),
+                "left": 0,
+                "cached": 0,
+                "context": 0,
+                "ttl_known": False,
+                "compacted_at": int(compact_at),
+            })
         if sid not in out or out[sid]["age"] > row["age"]:
             out[sid] = row
     return list(out.values())
@@ -640,7 +663,7 @@ def collect():
         r["display"] = r.get("title") or r["label"]
     # live sessions first, most urgent at the top; then the cold ones by recency
     rows.sort(key=lambda r: (0, r["left"])
-              if r["state"] in ("warm", "expiring", "est_warm")
+              if r["state"] in ("warm", "expiring", "est_warm", "compacted")
               else (1, r["age"]))
     if titles != before:
         try:
@@ -667,11 +690,13 @@ def kt(n):
 
 
 ICON = {"warm": "🔥", "expiring": "⚠️", "cold": "❄️", "untracked": "🟡",
-        "est_warm": "🟢", "uncertain": "🟡", "est_gone": "🔴"}
+        "est_warm": "🟢", "uncertain": "🟡", "est_gone": "🔴", "compacted": "🧹"}
 
 
 def describe(r):
     hit = (" · %d%% hit" % r["hit_rate"]) if r.get("hit_rate") is not None else ""
+    if r["state"] == "compacted":
+        return "compacted %s ago — next turn writes a fresh prefix" % hms(r["age"])
     if r["state"] == "untracked":
         return "%s cached · %d%% hit · idle %s" % (
             kt(r["cached"]), r.get("hit_rate", 0), hms(r["age"]))
