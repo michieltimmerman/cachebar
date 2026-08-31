@@ -88,6 +88,7 @@ All knobs are environment variables read by `ai-cache-bar.py`:
 | `AI_CACHE_WARN_SECONDS` | `600` | "Expiring" warning lead time |
 | `AI_CACHE_LOOKBACK_MIN` | `240` | How far back to look for sessions |
 | `AI_CACHE_MAX_ROWS` | `10` | Rows shown per surface |
+| `AI_CACHE_TAIL_BYTES` | `262144` | How much of each transcript's tail to read |
 | `AI_CACHE_NOTIFY_MAX_AGE` | `7200` | Don't notify about sessions idle longer than this |
 | `AI_CACHE_5H_PER_PCT` | `179000` | Weighted tokens per 1% of the five-hour limit (see calibration) |
 | `AI_CACHE_7D_PER_PCT` | `1500000` | Same for the seven-day limit (much less certain) |
@@ -163,8 +164,8 @@ routes in the app were tried:
 for ad-hoc-signed apps, even ones registered with LaunchServices. An **Apple
 Development** certificate (free personal team) is enough; `build.sh` picks one up
 from the keychain automatically, or set `CODESIGN_IDENTITY`. Without one, the app
-falls back to `terminal-notifier` (which keeps click-to-reveal via `-execute`),
-or `osascript` as a last resort.
+falls back to `terminal-notifier`, or `osascript` as a last resort. All three
+paths post plain informational banners — no click actions (see above).
 
 ## Also here: codex
 
