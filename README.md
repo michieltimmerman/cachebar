@@ -59,7 +59,7 @@ mise run status     # one-line-per-session summary in the terminal
 mise run dist       # shareable dist/CacheBar.zip
 ```
 
-Without mise: `packaging/build.sh && open -n ~/Applications/CacheBar.app`.
+Without mise: `packaging/build.sh && open ~/Applications/CacheBar.app`.
 
 The menu has a **Launch at login** toggle (`SMAppService`; it appears under
 System Settings → General → Login Items like any other app).
