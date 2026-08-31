@@ -5,7 +5,9 @@ across the Claude Code sessions on this machine — plus a couple of CLI surface
 over the same data.
 
 Everything is derived from files the tools already write locally. No API calls,
-no network, no credentials.
+no network, no credentials. Contributors and AI agents: **[AGENTS.md](AGENTS.md)**
+carries the architecture rules, the hazards, and every platform fact this tool
+rests on with its evidence — read it before changing anything.
 
 ```
 🔥 44m                                    ← menu bar: hottest session's countdown
@@ -43,6 +45,7 @@ chats warm is close to free; letting them chill is not.
 | `packaging/build.sh` | Release-builds via SwiftPM and assembles `CacheBar.app`: Info.plist, icon, codesigning, and `ai-cache-bar.py` bundled into Resources so a build deploys both halves. |
 | `packaging/make-icns.sh`, `render-icon.swift` | Regenerate the committed `CacheBar.icns` (only needed when the design changes). |
 | `cache-ttl.sh` | Older single-session tool: countdown, `--watch`, `--history` of cache invalidations, statusline widget via `--stdin`. Needs `jq`. |
+| `AGENTS.md` | The steering document: architecture rules, hazards, and all platform findings with sources. |
 
 ## Install
 
@@ -191,6 +194,30 @@ A resume spawns a new rollout file, so rows dedupe by the `session_meta` head
 line's `session_id`. Chat names (auto-generated and user renames alike) live in
 `~/.codex/session_index.jsonl` as `thread_name`, keyed by that same id; unnamed
 chats fall back to a cwd@branch label.
+
+## Provenance
+
+Nearly everything this tool relies on was established empirically
+(2026-08-28 → 2026-08-31), not from documentation:
+
+- **Claude Code transcripts** (`~/.claude/projects/**/*.jsonl`) — TTL tier,
+  titles, usage structure and its per-content-block duplication, `quotaLimits`
+  verdicts.
+- **Desktop app internals** — deep-link routes and their behavior read out of
+  `Claude.app/Contents/Resources/app.asar` and confirmed against
+  `~/Library/Logs/Claude/main.log`; session-id mapping from the app's session
+  store and `git-worktrees.json`.
+- **`plan-usage-history.json`** — 30 days of five-minute plan-usage samples,
+  regressed against transcript token sums for the calibration.
+- **Codex rollouts** (`~/.codex/sessions`) and `session_index.jsonl` — session
+  identity, titles, and 1,019 (idle gap → cache hit?) pairs for the eviction
+  curve; the only external anchors are OpenAI's prompt-caching guidance
+  ("5–10 minutes typical, up to one hour") and Anthropic's published cache
+  pricing (1.25× write / 0.1× read).
+
+None of this is contractual. Numbers are one account's fit, behaviors are one
+app version's. [AGENTS.md](AGENTS.md) records each fact next to its evidence
+so drift is checkable.
 
 ## License
 
