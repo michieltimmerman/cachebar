@@ -6,9 +6,9 @@
 #   release.sh --local 1.2.0   build + test here, then publish this Mac's build
 #                              with `gh release create` (no Actions needed)
 #
-# This repo has two remotes: `origin` is GitLab, `github` is GitHub. Releases live
-# on GitHub, so the remote whose URL contains github.com is used to compare main,
-# push the tag and address `gh` (which has no default repo here). REMOTE=<name>
+# Releases live on GitHub, so the remote whose URL contains github.com, whatever
+# it is called, is used to compare main, push the tag and address `gh` (so a
+# clone with more remotes, or none named origin, still works). REMOTE=<name>
 # overrides the detection.
 #
 # Releases are signed with a "Developer ID Application" identity when the

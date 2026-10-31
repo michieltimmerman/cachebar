@@ -9,8 +9,8 @@
 # Every value is read here and piped straight into `gh secret set`; nothing is
 # written to disk or echoed.
 #
-# This repo has two remotes (`origin` is GitLab, `github` is GitHub) and `gh` has
-# no default repo, so the target is the remote whose URL contains github.com.
+# The target is the remote whose URL contains github.com, whatever it is called,
+# so a clone with more remotes still sets the secrets on the right repo.
 # Override with REPO=owner/name (or REMOTE=<remote name>).
 set -euo pipefail
 cd "$(dirname "$0")/.."

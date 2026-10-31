@@ -58,7 +58,8 @@ correct it in place and keep what was believed before, marked superseded.
    The app seeds its in-memory maps on the first poll so launch never floods; the
    CLI keeps `~/.claude/.ai-cache-bar-state.json` and seeds it on its first run
    (no state file yet: record, don't announce). Delivery in the app:
-   `UNUserNotificationCenter` when granted (Developer ID builds only), else
+   `UNUserNotificationCenter` when granted (any signature, from a normal folder),
+   else
    `NSUserNotificationCenter`, else `osascript` for a bare binary without a
    bundle. Both centers get one identifier per session, so a session replaces its
    own earlier banner, never another's. A user who declines the native prompt
@@ -206,8 +207,8 @@ files, title cache). Everything is driven by a fixture HOME instead:
 | Plan usage is sampled locally, **only while the desktop app is open** | `~/Library/Application Support/Claude/plan-usage-history.json`: `{"version", "samples": [{"t": epoch_ms, "org", "u": {"fh": pct, "sd": pct}}]}`, five-hour / seven-day limits as whole percentages, ~30 days kept. Believed to be every ~5 min in August (**superseded**): on 2026-10-31 the file held 57 samples from 2026-09-30 to 2026-10-30, so gaps of hours to days. |
 | The server's rate-limit verdict lands in transcripts | `quotaLimits {status, rateLimitType, resetsAt (epoch s), overageStatus, overageDisabledReason}`. `org_level_disabled` overage ⇒ 100% is a hard stop. |
 | `statusLine` is CLI-only | The desktop app ignores it; upstream request anthropics/claude-code#41456. |
-| `UNUserNotificationCenter` is granted **only to Developer ID builds** | `requestAuthorization` → `UNErrorDomain Code=1` ("Notifications are not allowed for this application") for ad-hoc and Apple Development signatures alike, even `lsregister`ed under a fresh bundle id. Apple Development was first seen refused in August; the earlier belief that an Apple Development certificate is enough was **wrong**. Both re-verified on the development Mac 2026-10-31. |
-| `NSUserNotificationCenter` works without authorization | Deprecated, but delivers from an ad-hoc or Apple Development signed bundle with no authorization request, shown as the posting app with its icon; a newer notification with the same `identifier` replaces the one still showing. The app's fallback for every non-Developer-ID build. |
+| `UNUserNotificationCenter` depends on **where the app lives, not its signature** | 2026-10-31, macOS 26: fresh-bundle-id probes requesting provisional authorization were granted, ad-hoc and Apple Development alike, from `~/Applications`, `~/Desktop`, `~/Downloads` and a repo's `.build` folder (launched with `open` or directly), and refused with `UNErrorDomain Code=1` ("Notifications are not allowed for this application") from `/private/tmp`. The installed Apple Development CacheBar logs `notifications: UNUserNotificationCenter`. Superseded beliefs: "an Apple Development certificate is enough" (August) and "only Developer ID builds" (the morning of 2026-10-31, from probes that happened to live under `/private/tmp`) were both **wrong**. Developer ID itself is untested. |
+| `NSUserNotificationCenter` works without authorization | Deprecated, but delivers from an ad-hoc or Apple Development signed bundle with no authorization request, shown as the posting app with its icon; a newer notification with the same `identifier` replaces the one still showing. The app's fallback wherever macOS refuses the native route. |
 | `/usr/bin/python3` is a stub without the Command Line Tools | Running it opens the CLT install dialog instead of running anything. `xcode-select -p` fails without CLT and never prompts, so `Pythons.vet` checks it first and never runs the stub. |
 | Gatekeeper no longer lets right-click → Open bypass it (macOS 15+) | Un-notarized downloads need **System Settings → Privacy & Security → Open Anyway**, or `xattr -dr com.apple.quarantine`. Release notes say so whenever a build isn't notarized. |
 
@@ -308,10 +309,11 @@ calibration). Notify once per event, only while fresh (≤30 min).
   explaining "Open Anyway". `release.sh --local` uses a keychain Developer ID or
   ad-hoc, never Apple Development, and does not notarize. `release.yml` stands
   down when the release already exists (the `--local` path created it).
-- Only a Developer ID build gets native notifications; every other build uses
-  the `NSUserNotificationCenter` fallback. Notification authorization is cached
-  per bundle id (`CACHEBAR_BUNDLE_ID` for a fresh one).
+- Native notifications don't depend on the signature (see the facts table);
+  where macOS refuses them the app uses the `NSUserNotificationCenter` fallback.
+  Notification authorization is cached per bundle id (`CACHEBAR_BUNDLE_ID` for a
+  fresh one).
 - `release.sh` refuses a dirty tree, a branch other than `main`, an existing tag,
   or a `main` that differs from the GitHub remote's, and runs the build, script
-  tests and e2e tests before tagging. The repo has two remotes (`origin` GitLab,
-  `github` GitHub); the scripts pick the github.com one (`REMOTE=` overrides).
+  tests and e2e tests before tagging. The scripts pick the remote whose URL
+  contains github.com, whatever its name (`REMOTE=` overrides).

@@ -145,15 +145,16 @@ less than two hours, only on changes (never for what was already true at launch)
 and never for codex estimates. Turn them off in Settings or with
 `--notifications off`.
 
-How a banner is delivered depends on the app's signature:
+How a banner is delivered:
 
-- **Developer ID builds** (notarized releases) use `UNUserNotificationCenter`,
-  with the usual permission prompt.
-- **Every other build** (ad-hoc releases and local builds, Apple Development
-  signed ones included) is refused that route by macOS: `UNErrorDomain Code=1`,
-  "Notifications are not allowed for this application". CacheBar then posts
-  through the deprecated `NSUserNotificationCenter`, which asks for no permission
-  and still shows the banner as CacheBar, with its icon.
+- `UNUserNotificationCenter`, with the usual permission prompt, whenever macOS
+  allows it. That depends on where the app lives, not on how it's signed: ad-hoc
+  releases and local builds get it from Applications, the Desktop, Downloads or a
+  build folder alike. Decline the prompt and CacheBar posts nothing.
+- Where macOS refuses that route (seen for an app under `/private/tmp`:
+  `UNErrorDomain Code=1`, "Notifications are not allowed for this application"),
+  CacheBar posts through the deprecated `NSUserNotificationCenter`, which asks for
+  no permission and still shows the banner as CacheBar, with its icon.
 - A bare `swift run` binary has no app bundle for either, and uses `osascript`.
 
 **Send test notification** checks delivery end to end. The CLI's `--notify`
@@ -434,8 +435,8 @@ mise run release 0.1.0         # tag v0.1.0 and push it; GitHub Actions builds a
 mise run release-local 0.1.0   # build here and publish with gh (no Actions)
 ```
 
-The repo has two remotes (`origin` on GitLab, `github` on GitHub); the scripts
-use the one whose URL contains github.com, or `REMOTE=<name>`.
+The scripts use the remote whose URL contains github.com, whatever its name, or
+`REMOTE=<name>`.
 
 - **`release`** triggers `.github/workflows/release.yml`. On a macOS runner it
   builds a universal app, versioned from the tag, and attaches `CacheBar.zip` and

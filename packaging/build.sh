@@ -62,11 +62,11 @@ plutil -replace CFBundleIdentifier -string "$BUNDLE_ID" "$APP/Contents/Info.plis
 plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP/Contents/Info.plist"
 plutil -replace CFBundleVersion -string "$BUILD" "$APP/Contents/Info.plist"
 
-# Notifications work with any signature. macOS grants UNUserNotificationCenter
-# only to a Developer ID build ("UNErrorDomain Code=1: Notifications are not
-# allowed for this application" for ad-hoc and Apple Development alike); other
-# builds post through the app's NSUserNotificationCenter fallback instead (no
-# terminal-notifier needed).
+# Notifications work with any signature: macOS grants UNUserNotificationCenter to
+# ad-hoc and Apple Development builds alike when they run from a normal folder such
+# as ~/Applications, and refuses it under /private/tmp ("UNErrorDomain Code=1:
+# Notifications are not allowed for this application"), where the app falls back
+# to the deprecated NSUserNotificationCenter (no terminal-notifier needed).
 IDENTITY="${CODESIGN_IDENTITY:-}"
 WANTED='Developer ID Application|Apple Development'
 [ "${SHARED:-}" = 1 ] && WANTED='Developer ID Application'

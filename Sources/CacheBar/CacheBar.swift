@@ -7,13 +7,14 @@
 // 15 s, and says in the menu when it can't: no Python, or the script failing, with
 // the last good data kept but marked stale.
 //
-// Notifications use UNUserNotificationCenter when macOS allows it, which takes a
-// Developer ID signature: ad-hoc and Apple Development builds get UNErrorDomain
-// Code=1 ("Notifications are not allowed for this application"), even registered
-// with LaunchServices under a fresh bundle id. Those builds post through the
-// deprecated NSUserNotificationCenter instead, which has no such gate and still
-// shows the banner as CacheBar, with its icon. A bare binary (`swift run`) has no
-// bundle for either and falls back to osascript.
+// Notifications use UNUserNotificationCenter when macOS allows it. That depends on
+// where the app lives, not on its signature: ad-hoc and Apple Development builds
+// alike get it from ~/Applications, the Desktop, Downloads or a build folder, and
+// UNErrorDomain Code=1 ("Notifications are not allowed for this application") from
+// /private/tmp (macOS 26, 2026-10-31). When refused, banners go through the
+// deprecated NSUserNotificationCenter, which has no such gate and still shows them
+// as CacheBar, with its icon. A bare binary (`swift run`) has no bundle for either
+// and falls back to osascript.
 import AppKit
 import ServiceManagement
 import SwiftUI
@@ -245,8 +246,9 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         center.requestAuthorization(options: [.alert, .sound]) { granted, error in
-            // An error means macOS refuses this signature (anything but a Developer
-            // ID); no error and no grant means the user said no.
+            // An error means macOS refuses the app this route (seen for an app
+            // under /private/tmp, whatever its signature); no error and no grant
+            // means the user said no.
             let declined = !granted && error == nil
             debug(granted ? "notifications: UNUserNotificationCenter"
                 : declined ? "notifications: declined by the user"
@@ -298,7 +300,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     }
 }
 
-/// The fallback for builds macOS won't give UNUserNotificationCenter. The
+/// The fallback when macOS refuses UNUserNotificationCenter. The
 /// deprecated NSUserNotificationCenter asks for no authorization (terminal-notifier
 /// relies on the same), and its banners still show as CacheBar, with its icon.
 /// Its deprecation warnings are expected; Swift has no way to silence them here.
