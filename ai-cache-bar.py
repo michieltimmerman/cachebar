@@ -6,15 +6,20 @@ Surfaces:
   --notify     macOS notification on warm -> expiring -> cold transitions
   --text       one-line-per-session summary for a terminal
   --json       machine-readable (what CacheBar.app consumes)
+  --calibrate  remeasure the plan-budget and codex calibrations now (CacheBar.app
+               runs this once per launch; otherwise both refresh at most daily)
 
 Providers, using only data these tools already write locally:
-  claude  ~/.claude/projects/**/*.jsonl  — ephemeral_1h cache TTL (verified on this
-          machine: every transcript reports ephemeral_1h_input_tokens, never 5m).
-          Each turn refreshes the TTL, so deadline = last turn + 1h. Exact countdown.
+  claude  ~/.claude/projects/**/*.jsonl  — the cache TTL is chosen per request, so
+          each session's tier is read from its own newest turn that wrote cache
+          (cache_creation.ephemeral_1h_input_tokens -> 1h, ephemeral_5m -> 5 min;
+          3600 when unknown). Each turn refreshes the TTL, so deadline = last turn
+          + TTL. Exact countdown.
   codex   ~/.codex/sessions/**/*.jsonl   — last_token_usage.cached_input_tokens per
           turn, one row per session_id (a resume spawns a new rollout file, so files
           must be deduped). OpenAI implicit caching has no contractual TTL, so the
-          countdown is an estimate (CODEX_TTL, measured locally) shown with a ~.
+          countdown is an estimate (codex_calibration(), measured locally) shown
+          with a ~.
 
 Chat titles come from the transcript's own "custom-title" / "ai-title" entries
 (a custom title wins), cached in .ai-cache-bar-titles.json so a full-file scan
@@ -22,45 +27,82 @@ happens at most once per session.
 
 No deep link can focus an already-open desktop-app chat (README.md documents the
 two claude:// routes that were tried and why each is wrong — one destructively),
-so rows carry the transcript path and CacheBar.app reveals it in Finder. The
-git-worktrees.json mapping is kept to collapse a resumed chat's transcripts into
-one row.
+so nothing is clickable: rows and notifications are information only. Rows still
+carry the transcript path, for reference. The git-worktrees.json mapping is kept
+to collapse a resumed chat's transcripts into one row.
 
-Warning threshold defaults to 10 minutes before expiry (AI_CACHE_WARN_SECONDS).
+Warning threshold defaults to 10 minutes before a one-hour cache expires
+(AI_CACHE_WARN_SECONDS changes it); a shorter tier gets the same share of its
+TTL, 50 seconds for a 5-minute chat.
 
 Plan budget: plan-usage-history.json gives the five-hour and seven-day limits as
 percentages, and budget() estimates what compacting every open chat would cost
-against them — see the calibration note above FIVE_HOUR_PER_PCT. Warm chats are
+against them — see the calibration note above DEFAULT_5H_PER_PCT. The divisor
+that turns weighted tokens into percent is fitted from this Mac's own history
+(plan_calibration()), since every plan tier has a different one. Warm chats are
 nearly free to compact (their context re-reads from cache, which does not count);
 cold ones are not.
 
-Deliberately uses /usr/bin/python3 (stdlib only, no jq, no mise) so it runs under
-SwiftBar's and launchd's minimal PATH.
+AI_CACHE_NOW (epoch seconds) pins the clock — every age, countdown, lookback and
+calibration-freshness check reads clock() — for golden tests and demo data.
+
+Stdlib only (no jq, no mise), Python 3.6+, so any python3 works and the
+/usr/bin/python3 shebang runs under SwiftBar's and launchd's minimal PATH. The app
+doesn't rely on the shebang: it finds a working python3 itself.
 """
+import bisect
 import calendar
 import glob
 import json
+import math
 import os
 import subprocess
 import sys
 import time
 
-TTL = int(os.environ.get("AI_CACHE_TTL_SECONDS", "3600"))
-WARN = int(os.environ.get("AI_CACHE_WARN_SECONDS", "600"))
+
+def _env_int(name):
+    """An integer knob, or None when it isn't set (so "set explicitly" is visible)."""
+    value = os.environ.get(name)
+    return int(value) if value else None
+
+
+# Claude's TTL is per request, so each session's is read from its own transcript
+# (cache_ttl()); AI_CACHE_TTL_SECONDS forces one value on every session.
+TTL_OVERRIDE = _env_int("AI_CACHE_TTL_SECONDS")
+DEFAULT_TTL = 3600
+WARN_OVERRIDE = _env_int("AI_CACHE_WARN_SECONDS")
+WARN = 600
 LOOKBACK = int(os.environ.get("AI_CACHE_LOOKBACK_MIN", "240")) * 60
 TAIL_BYTES = int(os.environ.get("AI_CACHE_TAIL_BYTES", str(256 * 1024)))
 MAX_ROWS = int(os.environ.get("AI_CACHE_MAX_ROWS", "10"))
 NOTIFY_MAX_AGE = int(os.environ.get("AI_CACHE_NOTIFY_MAX_AGE", "7200"))
+# A stale calibration is remeasured inline by whichever run finds it stale.
+# CacheBar.app sets this to 0 for its polls and runs --calibrate itself, daily and
+# with room to finish, so a long scan never lands in a poll it kills after 20 s.
+INLINE_FIT = os.environ.get("AI_CACHE_INLINE_FIT", "1") != "0"
 
 HOME = os.path.expanduser("~")
+PROJECTS = os.path.join(HOME, ".claude", "projects")
 STATE = os.path.join(HOME, ".claude", ".ai-cache-bar-state.json")
 TITLE_CACHE = os.path.join(HOME, ".claude", ".ai-cache-bar-titles.json")
 CODEX_CAL = os.path.join(HOME, ".claude", ".ai-cache-bar-codex.json")
+PLAN_CAL = os.path.join(HOME, ".claude", ".ai-cache-bar-plan.json")
+CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
 WORKTREES = os.path.join(HOME, "Library", "Application Support", "Claude",
                         "git-worktrees.json")
 
 
 # ---------------------------------------------------------------- file helpers
+
+def clock():
+    """Epoch seconds now — or AI_CACHE_NOW, which pins it for tests and demo data.
+
+    Everything time-relative takes its `now` from here, never time.time().
+    """
+    pinned = os.environ.get("AI_CACHE_NOW")
+    return float(pinned) if pinned else time.time()
+
 
 def tail_lines(path, nbytes=TAIL_BYTES):
     """Last lines of a file without reading the whole thing (transcripts get big)."""
@@ -92,6 +134,77 @@ def load_json(path, default):
             return json.load(fh)
     except (IOError, OSError, ValueError):
         return default
+
+
+def save_json(path, obj):
+    """Write via a temp file and rename, so a concurrent poll never reads half a
+    file. False when it can't be written (no ~/.claude, read-only, ...)."""
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(obj, fh)
+        os.replace(tmp, path)
+        return True
+    except (IOError, OSError):
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _fresh(stamp, now, span):
+    """stamp lies within the last `span` seconds (a future stamp — the clock was
+    pinned earlier than the cache — counts as stale)."""
+    return isinstance(stamp, (int, float)) and 0 <= now - stamp < span
+
+
+def cached_fit(path, measure, now, force=False):
+    """A calibration cached at `path`, remeasured on force (--calibrate, which
+    CacheBar.app fires once per launch) or when older than a day.
+
+    Returns None — the caller then uses its defaults — when the cache can't be
+    written: without it every 15 s poll would rescan the whole history. A claim
+    written before measuring keeps concurrent polls from scanning too; they make
+    do with the stale fit (or the defaults) for those few seconds.
+    """
+    cal = load_json(path, None)
+    if not isinstance(cal, dict):
+        cal = None
+    if cal and not force:
+        if _fresh(cal.get("computed_at"), now, 86400):
+            return cal
+        if _fresh(cal.get("claimed_at"), now, 600):
+            return cal if "computed_at" in cal else None
+    if not force and not INLINE_FIT:
+        return cal if cal and "computed_at" in cal else None
+    if not save_json(path, dict(cal or {}, claimed_at=int(now))):
+        return None
+    fit = measure()
+    fit["computed_at"] = int(now)
+    save_json(path, fit)
+    return fit
+
+
+def recent_files(pattern, now, skip=None, within=LOOKBACK):
+    for path in glob.iglob(pattern, recursive=True):
+        if skip and skip in path:
+            continue
+        try:
+            if now - os.stat(path).st_mtime <= within:
+                yield path
+        except OSError:
+            continue
+
+
+def claude_transcripts(now):
+    """Main-chain transcripts touched within the lookback. Globbed once per poll and
+    shared by the session rows and the quota check; sorted so that ties resolve the
+    same way on every run."""
+    # Subagents keep their own cache prefix in <session>/subagents/; they are not
+    # the session you are typing into, so they stay out of the menu bar.
+    return sorted(recent_files(os.path.join(PROJECTS, "**", "*.jsonl"), now,
+                               skip="/subagents/"))
 
 
 # ------------------------------------------------------------------ chat title
@@ -200,10 +313,15 @@ PLAN_USAGE = os.path.join(HOME, "Library", "Application Support", "Claude",
 # is not. The output multiplier is only jointly identified with the divisor
 # (14/179k and 18/206k fit equally well), so treat the pair as one calibration.
 #
+# The weights stay fixed; the divisor is what differs per plan tier, so
+# _measure_plan() refits it from this Mac's own history and the constants below
+# are only the fallback (that original account's fit).
+#
 # The seven-day figure rests on 3 windows that disagree by 44% — order of
 # magnitude only, quite possibly not even linear if sd is a max over sub-meters.
-FIVE_HOUR_PER_PCT = int(os.environ.get("AI_CACHE_5H_PER_PCT", "179000"))
-SEVEN_DAY_PER_PCT = int(os.environ.get("AI_CACHE_7D_PER_PCT", "1500000"))
+# It is never fitted; plan_calibration() scales it by the five-hour ratio.
+DEFAULT_5H_PER_PCT = 179000
+DEFAULT_7D_PER_PCT = 1500000
 OUTPUT_WEIGHT = 14
 CACHE_1H_WEIGHT = 1.6
 # Observed fable/opus ratio recovered independently by the fit as exactly 2.0, which
@@ -214,6 +332,21 @@ COMPACT_SUMMARY_OUT = int(os.environ.get("AI_CACHE_COMPACT_OUT", "4000"))
 # Smallest prefix rewrite worth a "you just paid the cold tax" notification.
 REWRITE_MIN = int(os.environ.get("AI_CACHE_REWRITE_MIN", "25000"))
 
+FIVE_HOURS = 5 * 3600
+# How far back the self-calibration reads. The app keeps ~30 days of samples,
+# pruned relative to its own last write, so one day of slack covers the oldest.
+PLAN_CAL_DAYS = 31
+# A window that peaked below 5% is mostly integer rounding (+/-10% at 5); one at
+# 100% is censored (the cap stopped it, so its fh understates its U).
+PLAN_MIN_PEAK = 5
+# Fewest usable windows before the fit replaces the default. Low on purpose: it is
+# a one-parameter fit, and the default is one account's divisor — off by the
+# plan-tier ratio (5-20x) for anyone on another tier.
+PLAN_MIN_WINDOWS = 3
+# Sanity range for a fitted divisor (default 179000); outside it the history is
+# measuring something else, e.g. a limit spent on claude.ai rather than here.
+PLAN_FIT_RANGE = (2000, 5000000)
+
 
 def model_weight(model):
     name = (model or "").lower()
@@ -223,31 +356,191 @@ def model_weight(model):
     return 1.0
 
 
-def plan_usage():
-    """Newest {"fh", "sd"} sample, or None when the app has never sampled."""
+def write_weight(ttl):
+    """Plan weight of a cache write: the 1h tier costs 1.6x the 5-minute one
+    (2x vs 1.25x base input, the same ratio the calibration recovered)."""
+    return 1.0 if ttl <= 300 else CACHE_1H_WEIGHT
+
+
+def weighted_tokens(usage, model):
+    """U for one API response — the calibrated weighting above."""
+    cc = usage.get("cache_creation")
+    cc = cc if isinstance(cc, dict) else {}
+    w5 = cc.get("ephemeral_5m_input_tokens")
+    w1 = cc.get("ephemeral_1h_input_tokens")
+    if w5 is None and w1 is None:
+        # no tier split recorded: count it at the API's default 5-minute tier
+        w5, w1 = usage.get("cache_creation_input_tokens") or 0, 0
+    return model_weight(model) * ((usage.get("input_tokens") or 0) + (w5 or 0)
+                                  + CACHE_1H_WEIGHT * (w1 or 0)
+                                  + OUTPUT_WEIGHT * (usage.get("output_tokens") or 0))
+
+
+def _plan_samples(now):
+    """(epoch, usage dict) samples up to now, oldest first, for the account of the
+    newest sample (each sample carries an "org"; someone switching accounts
+    would otherwise mix two plans' limits)."""
     raw = load_json(PLAN_USAGE, None)
-    if not isinstance(raw, dict):
-        return None
-    samples = raw.get("samples")
-    if not isinstance(samples, list) or not samples:
-        return None
-    last = samples[-1]
-    u = last.get("u") or {}
-    if "fh" not in u and "sd" not in u:
-        return None
-    return {"fh": u.get("fh"), "sd": u.get("sd"), "at": (last.get("t") or 0) / 1000.0}
+    samples = raw.get("samples") if isinstance(raw, dict) else None
+    if not isinstance(samples, list):
+        return []
+    out = []
+    for s in samples:
+        if not isinstance(s, dict) or not isinstance(s.get("u"), dict):
+            continue
+        t = s.get("t")
+        if isinstance(t, (int, float)) and t / 1000.0 <= now:
+            out.append((t / 1000.0, s.get("org"), s["u"]))
+    out.sort(key=lambda x: x[0])
+    org = out[-1][1] if out else None
+    return [(t, u) for t, o, u in out if o == org]
 
 
-def quota_reset(now):
+def plan_usage(now):
+    """Newest {"fh", "sd"} sample, or None when the app has never sampled."""
+    for at, u in reversed(_plan_samples(now)):
+        if "fh" in u or "sd" in u:
+            return {"fh": u.get("fh"), "sd": u.get("sd"), "at": at}
+    return None
+
+
+def _usage_events(since, now):
+    """(epoch, U) per API response since `since`, from every transcript including
+    subagents (their own cache prefix, but ~1/3 of real spend).
+
+    One response is written as one line per content block, each repeating its
+    usage, so entries are deduped by message.id (the last line wins: streaming
+    partials come first). Only aggregates leave this function.
+    """
+    seen = {}
+    pat = os.path.join(PROJECTS, "**", "*.jsonl")
+    for path in recent_files(pat, now, within=now - since):
+        try:
+            with open(path, "rb") as fh:
+                for line in fh:
+                    if b'"usage"' not in line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except ValueError:
+                        continue
+                    msg = e.get("message") if isinstance(e, dict) else None
+                    if not isinstance(msg, dict):
+                        continue
+                    usage, mid = msg.get("usage"), msg.get("id")
+                    if not (isinstance(usage, dict) and mid) \
+                            or msg.get("model") == "<synthetic>":
+                        continue
+                    at = epoch(e.get("timestamp", ""))
+                    if at is not None and since <= at <= now:
+                        seen[mid] = (at, weighted_tokens(usage, msg.get("model")))
+        except OSError:
+            continue
+    return sorted(seen.values())
+
+
+def _plan_windows(events, samples):
+    """(U at the window's peak sample, peak fh) per five-hour window.
+
+    The server opens a window at the first message after the previous one closed
+    and resets it five hours later, so windows are chained from local usage. A
+    sample that reads 0, or lower than an earlier one in the same window, proves
+    the server's window had already reset (it was opened earlier, e.g. from
+    another device): the local window ends there and the next one starts at the
+    first response after that sample. U counts usage up to the peak sample only.
+    """
+    times = [t for t, _ in samples]
+    out = []
+    i = 0
+    while i < len(events):
+        start = events[i][0]
+        end = start + FIVE_HOURS
+        peak = at = None
+        for t, fh in samples[bisect.bisect_left(times, start):]:
+            if t >= end:
+                break
+            if (fh == 0 and t > start) or (peak is not None and fh < peak):
+                end = t
+                break
+            if peak is None or fh > peak:
+                peak, at = fh, t  # first sample to reach the peak
+        # First response at/after end; always past i, or a reset sample at the
+        # window's very first second would loop here forever.
+        j = max(bisect.bisect_left(events, (end,), i), i + 1)
+        if peak is not None:
+            out.append((sum(u for t, u in events[i:j] if t <= at), peak))
+        i = j
+    return out
+
+
+def _measure_plan(now):
+    """Fit the five-hour divisor from this Mac's own history: least squares
+    through the origin of each window's U against its peak fh, with the weights
+    above held fixed. per_pct_5h is None when fewer than PLAN_MIN_WINDOWS windows
+    are usable. Aggregates only — no transcript content, title or path is kept.
+    """
+    started = time.time()
+    samples = [(t, u["fh"]) for t, u in _plan_samples(now)
+               if isinstance(u.get("fh"), (int, float))
+               and t >= now - PLAN_CAL_DAYS * 86400]
+    pts = []
+    if samples:
+        # A window holding the oldest sample opened at most five hours before it.
+        events = _usage_events(samples[0][0] - FIVE_HOURS, now)
+        pts = [(u, p) for u, p in _plan_windows(events, samples)
+               if PLAN_MIN_PEAK <= p < 100 and u > 0]
+    fit = {"per_pct_5h": None, "windows": len(pts), "r2": None}
+    if len(pts) >= PLAN_MIN_WINDOWS:
+        d = sum(u * p for u, p in pts) / float(sum(p * p for u, p in pts))
+        mean = sum(u for u, _ in pts) / float(len(pts))
+        sst = sum((u - mean) ** 2 for u, _ in pts)
+        if sst:
+            fit["r2"] = round(1 - sum((u - d * p) ** 2 for u, p in pts) / sst, 3)
+        if PLAN_FIT_RANGE[0] <= d <= PLAN_FIT_RANGE[1]:
+            fit["per_pct_5h"] = int(round(d))
+        else:
+            fit["rejected"] = int(round(d))
+    fit["scan_seconds"] = round(time.time() - started, 1)
+    return fit
+
+
+def plan_calibration(now, force=False):
+    """Divisors that turn weighted tokens into percent of each plan limit.
+
+    source "env": AI_CACHE_5H_PER_PCT, which skips the fit entirely; "fitted":
+    _measure_plan() on this Mac's history, cached like the codex curve; "default":
+    too little history (or no writable cache), so the original account's
+    constants. The seven-day divisor is scaled by the same ratio as the five-hour
+    one — an assumption (that a plan tier scales both limits alike), not a
+    measurement — unless AI_CACHE_7D_PER_PCT sets it.
+    """
+    env5 = _env_int("AI_CACHE_5H_PER_PCT")
+    fit = {}
+    if env5 is None or force:
+        fit = cached_fit(PLAN_CAL, lambda: _measure_plan(now), now, force) or {}
+    if env5 is not None:
+        cal = {"source": "env", "windows": 0, "per_pct_5h": env5}
+    elif fit.get("per_pct_5h"):
+        cal = {"source": "fitted", "windows": fit["windows"],
+               "per_pct_5h": fit["per_pct_5h"]}
+    else:
+        cal = {"source": "default", "windows": fit.get("windows", 0),
+               "per_pct_5h": DEFAULT_5H_PER_PCT}
+    env7 = _env_int("AI_CACHE_7D_PER_PCT")
+    cal["per_pct_7d"] = env7 if env7 is not None else int(round(
+        DEFAULT_7D_PER_PCT * cal["per_pct_5h"] / float(DEFAULT_5H_PER_PCT)))
+    return cal
+
+
+def quota_reset(now, paths):
     """Reset time of a limit that is currently being enforced, if any.
 
     Claude Code writes the server's rate-limit verdict into the transcript as
     quotaLimits {status, rateLimitType, resetsAt}. A resetsAt in the past is just
     an old rejection, so only a future one is reported.
     """
-    pat = os.path.join(HOME, ".claude", "projects", "**", "*.jsonl")
     best = None
-    for path in recent_files(pat, now, skip="/subagents/"):
+    for path in paths:
         for line in reversed(tail_lines(path, 64 * 1024)):
             if b"quotaLimits" not in line:
                 continue
@@ -292,27 +585,34 @@ def compaction_cost(row):
 
     A warm chat's context re-enters the request as a cache read, which does not
     count against the plan at all, so only the summary output costs anything. A cold
-    chat has to have its whole context rewritten first.
+    chat has to have its whole context rewritten first, at its own cache tier.
     """
     ctx = row.get("context") or 0
-    rewrite = 0 if row["state"] in ("warm", "expiring") else ctx * CACHE_1H_WEIGHT
+    rewrite = (0 if row["state"] in ("warm", "expiring")
+               else ctx * write_weight(row.get("ttl", DEFAULT_TTL)))
     return model_weight(row["model"]) * (rewrite + COMPACT_SUMMARY_OUT * OUTPUT_WEIGHT)
 
 
-def budget(rows, now):
+def pct_int(x):
+    """Whole percent, rounding half up (not Python's half-to-even), so a port
+    reproduces it exactly."""
+    return int(math.floor(x + 0.5))
+
+
+def budget(rows, now, paths, cal):
     """What compacting every open chat would cost against the plan limits."""
     chats = [r for r in rows if r["tool"] == "claude"]
     total = sum(compaction_cost(r) for r in chats)
     cold = [r for r in chats if r["state"] == "cold"]
-    usage = plan_usage()
+    per_5h, per_7d = float(cal["per_pct_5h"]), float(cal["per_pct_7d"])
+    usage = plan_usage(now)
     out = {
         "chats": len(chats),
         "cold_chats": len(cold),
         "compaction_tokens": int(total),
-        "compaction_pct_5h": round(total / float(FIVE_HOUR_PER_PCT), 1),
-        "compaction_pct_7d": round(total / float(SEVEN_DAY_PER_PCT), 1),
-        "cold_share_pct_5h": round(sum(compaction_cost(r) for r in cold)
-                                   / float(FIVE_HOUR_PER_PCT), 1),
+        "compaction_pct_5h": round(total / per_5h, 1),
+        "compaction_pct_7d": round(total / per_7d, 1),
+        "cold_share_pct_5h": round(sum(compaction_cost(r) for r in cold) / per_5h, 1),
         "used_pct_5h": None,
         "used_pct_7d": None,
         "left_pct_5h": None,
@@ -320,43 +620,63 @@ def budget(rows, now):
         "usage_sample_age": None,
         "would_exhaust_5h": False,
         "would_exhaust_7d": False,
-        "reset": quota_reset(now),
+        "reset": quota_reset(now, paths),
+        "calibration": {"source": cal["source"], "windows": cal["windows"],
+                        "per_pct_5h": cal["per_pct_5h"]},
     }
     if usage:
-        out["usage_sample_age"] = int(now - usage["at"]) if usage["at"] else None
-        if isinstance(usage.get("fh"), (int, float)):
-            out["used_pct_5h"] = usage["fh"]
-            out["left_pct_5h"] = max(0, 100 - usage["fh"])
+        age = int(now - usage["at"])
+        out["usage_sample_age"] = age
+        # A sample older than its limit's window describes a window that has
+        # since reset: what is used now is unknown, not what it said then.
+        if isinstance(usage.get("fh"), (int, float)) and age < FIVE_HOURS:
+            out["used_pct_5h"] = pct_int(usage["fh"])
+            out["left_pct_5h"] = max(0, 100 - out["used_pct_5h"])
             out["would_exhaust_5h"] = out["compaction_pct_5h"] >= out["left_pct_5h"]
-        if isinstance(usage.get("sd"), (int, float)):
-            out["used_pct_7d"] = usage["sd"]
-            out["left_pct_7d"] = max(0, 100 - usage["sd"])
+        if isinstance(usage.get("sd"), (int, float)) and age < 7 * 86400:
+            out["used_pct_7d"] = pct_int(usage["sd"])
+            out["left_pct_7d"] = max(0, 100 - out["used_pct_7d"])
             out["would_exhaust_7d"] = out["compaction_pct_7d"] >= out["left_pct_7d"]
     return out
 
 
 # ------------------------------------------------------------------- providers
 
-def recent_files(pattern, now, skip=None):
-    for path in glob.iglob(pattern, recursive=True):
-        if skip and skip in path:
-            continue
-        try:
-            if now - os.stat(path).st_mtime <= LOOKBACK:
-                yield path
-        except OSError:
-            continue
+def cache_ttl(usage):
+    """TTL tier a turn wrote its cache at, from the cache_creation split; None when
+    it wrote nothing or predates the split.
+
+    Claude Code mostly writes the 1h tier but switches some sessions to the 5-minute
+    one mid-chat (subagents always use it), so the newest write is what counts.
+    Both tiers in one turn was never observed; the larger write would govern.
+    """
+    cc = usage.get("cache_creation")
+    if not isinstance(cc, dict):
+        return None
+    w5 = cc.get("ephemeral_5m_input_tokens") or 0
+    w1 = cc.get("ephemeral_1h_input_tokens") or 0
+    if not (w5 or w1):
+        return None
+    return 300 if w5 > w1 else 3600
 
 
-def claude_sessions(now, titles):
+def warn_for(ttl):
+    """Lead time of the "expiring" state. The base (AI_CACHE_WARN_SECONDS, else 10
+    minutes) is meant for a one-hour cache; a shorter tier gets the same share of
+    its TTL, so a 5-minute chat isn't expiring from its first second. With the TTL
+    pinned by AI_CACHE_TTL_SECONDS (the test trick) an explicit base applies as is."""
+    if TTL_OVERRIDE is not None:
+        return WARN_OVERRIDE if WARN_OVERRIDE is not None else min(WARN, ttl // 6)
+    base = WARN_OVERRIDE if WARN_OVERRIDE is not None else WARN
+    return base * min(ttl, 3600) // 3600
+
+
+def claude_sessions(now, titles, paths, per_pct_5h):
     out = {}
     owners = worktree_owners()
-    pat = os.path.join(HOME, ".claude", "projects", "**", "*.jsonl")
-    # Subagents keep their own cache prefix in <session>/subagents/; they are not
-    # the session you are typing into, so they stay out of the menu bar.
-    for path in recent_files(pat, now, skip="/subagents/"):
+    for path in paths:
         tail = tail_lines(path)
-        last = prev = compact_at = None
+        last = prev = compact_at = ttl = None
         for line in reversed(tail):
             try:
                 e = json.loads(line)
@@ -367,17 +687,29 @@ def claude_sessions(now, titles):
             # so the first hit is the newest.
             if e.get("isCompactSummary") and compact_at is None:
                 compact_at = epoch(e.get("timestamp", ""))
-            usage = (e.get("message") or {}).get("usage")
+            msg = e.get("message") or {}
+            usage = msg.get("usage")
             if not (usage and e.get("requestId") and not e.get("isSidechain")):
                 continue
+            # "<synthetic>" entries (compaction stubs, API-error notices such as a
+            # rate-limit rejection) carry all-zero usage: no turn happened.
+            if msg.get("model") == "<synthetic>":
+                continue
+            if ttl is None:
+                ttl = cache_ttl(usage)
             if last is None:
                 last = (e, usage)
-            elif e["requestId"] != last[0]["requestId"]:
+            elif prev is None and e["requestId"] != last[0]["requestId"]:
                 # reversed scan, so this is the final entry of the turn before
                 prev = (e, usage)
+            if prev is not None and ttl is not None:
                 break
         if not last:
             continue
+        if TTL_OVERRIDE is not None:
+            ttl = TTL_OVERRIDE
+        elif ttl is None:
+            ttl = DEFAULT_TTL
         e, usage = last
         at = epoch(e.get("timestamp", ""))
         if at is None:
@@ -402,10 +734,10 @@ def claude_sessions(now, titles):
                              and compact_at > p_at)
             if (p_at is not None and not by_compaction
                     and p_tot > 5000 and wrote >= REWRITE_MIN
-                    and read < p_tot * 0.5 and at - p_at >= TTL):
+                    and read < p_tot * 0.5 and at - p_at >= ttl):
                 rewrote, rewrite_at, rewrite_gap = wrote, int(at), int(at - p_at)
-                rewrite_pct = round(model_weight(model) * wrote * CACHE_1H_WEIGHT
-                                    / FIVE_HOUR_PER_PCT, 1)
+                rewrite_pct = round(model_weight(model) * wrote * write_weight(ttl)
+                                    / per_pct_5h, 1)
         row = {
             "tool": "claude",
             "session": sid,
@@ -414,7 +746,8 @@ def claude_sessions(now, titles):
             "model": model,
             "cwd": cwd,
             "age": int(now - at),
-            "left": int(TTL - (now - at)),
+            "left": int(ttl - (now - at)),
+            "ttl": ttl,
             "cached": (usage.get("cache_read_input_tokens") or 0)
             + (usage.get("cache_creation_input_tokens") or 0),
             # everything a compaction would have to re-send
@@ -449,6 +782,10 @@ def claude_sessions(now, titles):
     return list(out.values())
 
 
+CODEX_DEFAULT = {"warm_s": 600, "dead_s": 3600, "maybe_pct": 50, "pairs": 0,
+                 "default": True}
+
+
 def _measure_codex():
     """Fit the codex eviction curve from this account's own rollout history.
 
@@ -460,8 +797,7 @@ def _measure_codex():
     history is too thin to say anything.
     """
     sessions = {}
-    for f in glob.iglob(os.path.join(HOME, ".codex", "sessions", "**", "*.jsonl"),
-                        recursive=True):
+    for f in glob.iglob(os.path.join(CODEX_SESSIONS, "**", "*.jsonl"), recursive=True):
         sid = None
         try:
             with open(f, "rb") as fh:
@@ -519,17 +855,9 @@ def _measure_codex():
 
 def codex_calibration(now, force=False):
     """Cached eviction-curve fit; remeasured at most daily (or on --calibrate,
-    which CacheBar.app fires once per launch)."""
-    cal = None if force else load_json(CODEX_CAL, None)
-    if not (cal and now - cal.get("computed_at", 0) < 86400):
-        cal = _measure_codex() or {"warm_s": 600, "dead_s": 3600,
-                                   "maybe_pct": 50, "pairs": 0, "default": True}
-        cal["computed_at"] = int(now)
-        try:
-            with open(CODEX_CAL, "w") as fh:
-                json.dump(cal, fh)
-        except (IOError, OSError):
-            pass
+    which CacheBar.app fires once per launch). Defaults when it can't be cached."""
+    cal = cached_fit(CODEX_CAL, lambda: _measure_codex() or dict(CODEX_DEFAULT),
+                     now, force) or dict(CODEX_DEFAULT)
     env = os.environ.get("AI_CACHE_CODEX_TTL_SECONDS")
     if env:
         cal = dict(cal, warm_s=int(env))
@@ -573,11 +901,13 @@ def codex_sessions(now):
     # session_id in their session_meta head line — so dedupe by that id or one
     # chat shows up once per resume. Titles live in session_index.jsonl, not in
     # the rollouts; the cwd-based label is the fallback for unnamed chats.
+    if not os.path.isdir(CODEX_SESSIONS):
+        return []  # no codex here: no titles, no calibration scan, no glob
     out = {}
     titles = codex_titles()
     cal = codex_calibration(now)
-    pat = os.path.join(HOME, ".codex", "sessions", "**", "*.jsonl")
-    for path in recent_files(pat, now):
+    pat = os.path.join(CODEX_SESSIONS, "**", "*.jsonl")
+    for path in sorted(recent_files(pat, now)):
         for line in reversed(tail_lines(path)):
             try:
                 e = json.loads(line)
@@ -634,11 +964,10 @@ def codex_sessions(now):
     return list(out.values())
 
 
-def collect():
-    now = time.time()
+def collect(now, paths, cal):
     titles = load_json(TITLE_CACHE, {})
     before = dict(titles)
-    rows = claude_sessions(now, titles) + codex_sessions(now)
+    rows = claude_sessions(now, titles, paths, cal["per_pct_5h"]) + codex_sessions(now)
     # A worktree lease points at one chat, so several transcripts resolving to the
     # same app session are the same chat resumed; only the freshest is live.
     by_app = {}
@@ -656,7 +985,7 @@ def collect():
                 r["state"] = "untracked"
             elif r["left"] <= 0:
                 r["state"] = "cold"
-            elif r["left"] < WARN:
+            elif r["left"] < warn_for(r.get("ttl", DEFAULT_TTL)):
                 r["state"] = "expiring"
             else:
                 r["state"] = "warm"
@@ -666,11 +995,7 @@ def collect():
               if r["state"] in ("warm", "expiring", "est_warm", "compacted")
               else (1, r["age"]))
     if titles != before:
-        try:
-            with open(TITLE_CACHE, "w") as fh:
-                json.dump(titles, fh)
-        except (IOError, OSError):
-            pass
+        save_json(TITLE_CACHE, titles)
     return rows
 
 
@@ -714,19 +1039,19 @@ def describe(r):
 
 def budget_line(b):
     """One line: what compacting everything costs, against what is left."""
-    cost = "compacting %d chats \u2248 %s%% of the 5h limit" % (
+    cost = "compacting %d chats ≈ %s%% of the 5h limit" % (
         b["chats"], b["compaction_pct_5h"])
     if b["left_pct_5h"] is None:
         return cost + " (plan usage unknown)"
-    return "%s \u00b7 %s%% left" % (cost, b["left_pct_5h"])
+    return "%s · %s%% left" % (cost, b["left_pct_5h"])
 
 
 def budget_detail(b):
     """The actionable part: cold chats are what makes compaction expensive."""
     if b["cold_chats"]:
-        return "%d cold \u2192 %spp of it; reopening one before it chills makes it free" % (
+        return "%d cold → %spp of it; reopening one before it chills makes it free" % (
             b["cold_chats"], b["cold_share_pct_5h"])
-    return "all warm \u2014 their context re-reads from cache for free"
+    return "all warm — their context re-reads from cache for free"
 
 
 def render_text(rows, b=None):
@@ -771,23 +1096,22 @@ def render_swiftbar(rows, b=None):
         print("%s%s" % (budget_line(b), colour))
         print("%s | size=11 color=gray" % budget_detail(b))
         if b["reset"]:
-            print("%s limit capping now \u00b7 resets in %s | size=11 color=orange"
+            print("%s limit capping now · resets in %s | size=11 color=orange"
                   % (b["reset"]["kind"] or "?", hms(b["reset"]["resets_in"])))
     print("---")
     print("Refresh | refresh=true")
 
 
-def notify(title, msg, group="ai-cache-bar"):
-    if os.path.exists("/opt/homebrew/bin/terminal-notifier"):
-        # a group per session, so a session's later notification replaces its own
-        # earlier one instead of clobbering a different session's
-        cmd = ["/opt/homebrew/bin/terminal-notifier", "-title", title,
-               "-message", msg, "-group", group]
-    else:
-        cmd = ["/usr/bin/osascript", "-e", "display notification %s with title %s"
-               % (json.dumps(msg), json.dumps(title))]
+def _notify(title, msg):
+    """A plain banner via osascript. Title and body travel as argv, never spliced
+    into the script text, so no chat title can inject AppleScript; the "--" stops
+    osascript from parsing a title that starts with "-" as one of its options."""
     try:
-        subprocess.call(cmd)
+        subprocess.call(["/usr/bin/osascript",
+                         "-e", "on run argv",
+                         "-e", "display notification (item 2 of argv)"
+                         " with title (item 1 of argv)",
+                         "-e", "end run", "--", title, msg])
     except OSError:
         pass
 
@@ -796,6 +1120,9 @@ BUDGET_KEY = "__compaction_budget__"
 
 
 def render_notify(rows, b=None):
+    # The first run only records where every chat stands; announcing all of them
+    # at once would be noise, not news.
+    notify = _notify if os.path.exists(STATE) else (lambda title, msg: None)
     prev = load_json(STATE, {})
     current = {}
     if b:
@@ -805,13 +1132,12 @@ def render_notify(rows, b=None):
         if flag == "tight" and prev.get(BUDGET_KEY, "ok") != "tight":
             cold = [r["display"] for r in rows
                     if r["tool"] == "claude" and r["state"] == "cold"]
-            who = ("Cold: " + " \u00b7 ".join(cold[:2])
+            who = ("Cold: " + " · ".join(cold[:2])
                    + (" +%d more" % (len(cold) - 2) if len(cold) > 2 else "")
                    ) if cold else budget_detail(b)
             notify("Compacting everything would exhaust your 5h limit",
-                   "%d chats \u2248 %s%% but only %s%% left. %s"
-                   % (b["chats"], b["compaction_pct_5h"], b["left_pct_5h"], who),
-                   group="ai-cache-bar-budget")
+                   "%d chats ≈ %s%% but only %s%% left. %s"
+                   % (b["chats"], b["compaction_pct_5h"], b["left_pct_5h"], who))
     for r in rows:
         if not r["ttl_known"] or r["age"] > NOTIFY_MAX_AGE or r.get("ttl_estimate"):
             continue  # estimated TTLs (codex) shape the display, never notifications
@@ -822,28 +1148,25 @@ def render_notify(rows, b=None):
             current[key] = r["rewrite_at"]
             if prev.get(key) != r["rewrite_at"] and (r.get("rewrite_age") or 0) <= 1800:
                 notify(r["display"],
-                       "Rewrote %s cached tokens after %s idle \u2014 \u2248%s%% of the 5h limit."
-                       % (kt(r["rewrote"]), hms(r["rewrite_gap"]), r["rewrite_pct_5h"]),
-                       group="ai-cache-bar-rewrite-" + r["session"])
+                       "Rewrote %s cached tokens after %s idle — ≈%s%% of the 5h limit."
+                       % (kt(r["rewrote"]), hms(r["rewrite_gap"]), r["rewrite_pct_5h"]))
         if prev.get(r["session"], "warm") == r["state"]:
             continue
         # The chat title is the headline — a "Cache expiring:" prefix pushes
         # long titles out of the banner's single bold line.
+        ttl = r.get("ttl", DEFAULT_TTL)
         if r["state"] == "expiring":
             notify(r["display"],
-                   "Cache expiring \u2014 %s left on %s cached. Any message refreshes the hour."
-                   % (hms(r["left"]), kt(r["cached"])),
-                   group="ai-cache-bar-" + r["session"])
+                   "Cache expiring — %s left on %s cached. %s"
+                   % (hms(r["left"]), kt(r["cached"]),
+                      "Any message refreshes the hour." if ttl == 3600
+                      else "Any message refreshes its %s TTL." % hms(ttl)))
         elif r["state"] == "cold":
+            # list prices: a 1h-tier write is 2x base input, a 5-minute one 1.25x
             notify(r["display"],
-                   "Cache went cold \u2014 next turn rewrites %s at 1.25x instead of reading at 0.1x."
-                   % kt(r["cached"]),
-                   group="ai-cache-bar-" + r["session"])
-    try:
-        with open(STATE, "w") as fh:
-            json.dump(current, fh)
-    except (IOError, OSError):
-        pass
+                   "Cache went cold — next turn rewrites %s at %s instead of reading at 0.1x."
+                   % (kt(r["cached"]), "1.25x" if ttl <= 300 else "2x"))
+    save_json(STATE, current)
 
 
 def main():
@@ -857,12 +1180,19 @@ def main():
         else:
             sys.stderr.write("unknown arg: %s\n" % a)
             return 2
+    now = clock()
     if mode == "calibrate":
-        json.dump(codex_calibration(time.time(), force=True), sys.stdout, indent=2)
+        out = {"plan": plan_calibration(now, force=True),
+               "plan_fit": load_json(PLAN_CAL, None),
+               "codex": (codex_calibration(now, force=True)
+                         if os.path.isdir(CODEX_SESSIONS) else None)}
+        json.dump(out, sys.stdout, indent=2)
         print()
         return 0
-    rows = collect()
-    b = budget(rows, time.time())
+    cal = plan_calibration(now)
+    paths = claude_transcripts(now)
+    rows = collect(now, paths, cal)
+    b = budget(rows, now, paths, cal)
     if mode == "json":
         # Wrapper, not a bare array: CacheBar.swift decodes {"sessions", "budget"}
         # and falls back to a bare array for older callers.

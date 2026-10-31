@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build (universal)
+        run: UNIVERSAL=1 packaging/build.sh
+
+      - name: Smoke test the built binary
+        run: |
+          ~/Applications/CacheBar.app/Contents/MacOS/CacheBar --version
+          ~/Applications/CacheBar.app/Contents/MacOS/CacheBar --help
+
+      # Golden tests of ai-cache-bar.py (stdlib Python); no Claude Code needed.
+      - name: Script tests
+        run: tests/script-tests.sh
+
+      # The real app binary against fixture data; needs no Claude Code or credentials.
+      - name: End-to-end tests
+        run: tests/e2e.sh

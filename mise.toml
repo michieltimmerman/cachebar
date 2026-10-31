@@ -12,9 +12,9 @@ open ~/Applications/CacheBar.app
 """
 
 [tasks.dist]
-description = "Build a shareable zip of CacheBar.app into dist/"
+description = "Build a shareable universal zip of CacheBar.app into dist/ (ad-hoc signed unless CODESIGN_IDENTITY is set)"
 run = """
-packaging/build.sh dist/CacheBar.app
+UNIVERSAL=1 SHARED=1 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}" packaging/build.sh dist/CacheBar.app
 ditto -c -k --keepParent dist/CacheBar.app dist/CacheBar.zip
 rm -rf dist/CacheBar.app
 echo "dist/CacheBar.zip"
@@ -31,3 +31,29 @@ run = "./ai-cache-bar.py --text"
 [tasks.json]
 description = "Machine-readable sessions + plan budget"
 run = "./ai-cache-bar.py --json"
+
+[tasks.test]
+description = "Build, then run the script tests (Python golden tests) and the end-to-end suite (real app)"
+run = """
+packaging/build.sh
+tests/script-tests.sh
+tests/e2e.sh
+"""
+
+[tasks.release]
+description = "Test, tag vX.Y.Z and push it; GitHub Actions builds and publishes the release"
+usage = 'arg "<version>" help="e.g. 1.2.0"'
+run = 'packaging/release.sh "${usage_version}"'
+
+[tasks.release-local]
+description = "Test, build on this Mac and publish it as release vX.Y.Z with gh (no Actions)"
+usage = 'arg "<version>" help="e.g. 1.2.0"'
+run = 'packaging/release.sh --local "${usage_version}"'
+
+[tasks.release-secrets]
+description = "Store the Developer ID signing + notarization secrets in the GitHub repo (interactive)"
+run = "packaging/release-secrets.sh"
+
+[tasks.demo]
+description = "Start CacheBar with demo data for screenshots"
+run = "tests/demo.sh"

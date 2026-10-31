@@ -1,0 +1,114 @@
+name: Release
+
+# Push a tag like v1.2.0 to build a universal CacheBar.app and attach it to a
+# GitHub release. With the secrets below it is signed with a Developer ID and
+# notarized, so it opens without Gatekeeper warnings; without them it is ad-hoc
+# signed and the release notes explain the one-time "Open Anyway" step.
+#
+#   MACOS_CERTIFICATE_P12        base64 of a "Developer ID Application" .p12
+#   MACOS_CERTIFICATE_PASSWORD   its password
+#   MACOS_SIGNING_IDENTITY       e.g. "Developer ID Application: Jane Doe (TEAMID)"
+#   APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD   for notarytool (app-specific password)
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # `packaging/release.sh --local` publishes the release itself, which creates
+  # the tag and so triggers this workflow; stand down when the release exists.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      exists: ${{ steps.release.outputs.exists }}
+    steps:
+      - id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: check
+    if: needs.check.outputs.exists != 'true'
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      HAS_CERT: ${{ secrets.MACOS_CERTIFICATE_P12 != '' }}
+      HAS_NOTARY: ${{ secrets.APPLE_APP_PASSWORD != '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Import Developer ID certificate
+        if: env.HAS_CERT == 'true'
+        env:
+          P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          KC="$RUNNER_TEMP/release.keychain-db"
+          KC_PASSWORD=$(openssl rand -base64 24)
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KC_PASSWORD" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PASSWORD" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "$KC_PASSWORD" "$KC" > /dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+
+      - name: Build
+        env:
+          CODESIGN_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: UNIVERSAL=1 SHARED=1 packaging/build.sh dist/CacheBar.app
+
+      - name: Notarize
+        if: env.HAS_CERT == 'true' && env.HAS_NOTARY == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          ditto -c -k --keepParent dist/CacheBar.app "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" --wait \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+          xcrun stapler staple dist/CacheBar.app
+          echo "NOTARIZED=true" >> "$GITHUB_ENV"
+
+      # A fixed asset name keeps .../releases/latest/download/CacheBar.zip stable.
+      - name: Package
+        run: |
+          ditto -c -k --keepParent dist/CacheBar.app dist/CacheBar.zip
+          (cd dist && shasum -a 256 CacheBar.zip > CacheBar.zip.sha256)
+
+      - name: Release notes
+        run: |
+          {
+            echo "Download **CacheBar.zip**, unzip it and move **CacheBar.app** to Applications."
+            echo "Requires macOS 14 or later and Claude Code, plus Python 3 (Apple's Command Line Tools:"
+            echo '`xcode-select --install`, or any python3); runs on Apple silicon and Intel.'
+            echo
+            if [ "${NOTARIZED:-}" != "true" ]; then
+              echo "This build is not notarized. On first launch macOS will refuse to open it:"
+              echo "open **System Settings → Privacy & Security** and click **Open Anyway**, or run"
+              echo '`xattr -dr com.apple.quarantine /Applications/CacheBar.app`.'
+              echo
+            fi
+          } > "$RUNNER_TEMP/notes.md"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/CacheBar.zip dist/CacheBar.zip.sha256 \
+            --title "CacheBar $VERSION" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes
