@@ -44,9 +44,12 @@ correct it in place and keep what was believed before, marked superseded.
    title, and keeps the last good data marked "Showing data as of … ago". The
    optional budget fields decode leniently: one bad field blanks itself instead
    of failing the payload.
-6. **Nothing is clickable.** Rows and notifications are information, not
+6. **No chat is clickable.** Rows and chat notifications are information, not
    actions; there is no safe way to open a chat (see Hazards). Do not add links,
-   click handlers, or buttons that "open" a session.
+   click handlers, or buttons that "open" a session. Clicks that open something
+   other than a chat are fine and go through `NoteAction` (`update`: the release
+   page; `settings`: the Settings window). Superseded: until 2026-11-27 this rule
+   read "Nothing is clickable", which also ruled out the update notification.
 7. **Known ≠ estimated, and the UI must say which.** Claude's TTL tier is
    recorded per turn in the transcript → deterministic 🔥/⚠️/❄️ states, exact
    countdowns, notifications. Codex's TTL is a measured estimate → traffic light
@@ -55,7 +58,10 @@ correct it in place and keep what was believed before, marked superseded.
 8. **Notification shape and delivery.** The chat title is the headline (macOS
    banners give one bold line, ~35 chars; a `"Cache expiring:"` prefix pushes
    real titles out); the state goes in the body. Fire on **transitions only**.
-   The app seeds its in-memory maps on the first poll so launch never floods; the
+   The app seeds its in-memory maps on the first poll so launch never floods,
+   and again on wake: polls pause at `willSleep`, and `didWake` records what
+   changed while asleep instead of announcing it (a poll that started before the
+   wake never becomes the baseline). An unlock without sleep only refreshes. The
    CLI keeps `~/.claude/.ai-cache-bar-state.json` and seeds it on its first run
    (no state file yet: record, don't announce). Delivery in the app:
    `UNUserNotificationCenter` when granted (any signature, from a normal folder),
@@ -81,13 +87,29 @@ correct it in place and keep what was believed before, marked superseded.
     (`AI_CACHE_NOW` pins it); transcripts are sorted before use; `pct_int` rounds
     half up. `tests/golden/` is the behavioral reference for a future Swift port
     of the script, so keep it reproducible.
-12. **mise is the task runner** (`mise run app|build|test|demo|dist|icon|status|json|release|release-local|release-secrets`).
+12. **mise is the task runner** (`mise run app|build|test|demo|dist|icon|status|json|compat|release|release-local|release-secrets`).
     Relaunch with plain `open`: `open -n` force-spawns duplicate instances and
     duplicate menu bar items.
 13. The app must live in `~/Applications` (or `/Applications`) for `SMAppService`
     launch-at-login registration (a translocated copy says so in the menu), and it
     does **not** survive logout/reboot without that toggle. "The app disappeared"
     after a weekend is almost always this, not a crash.
+
+14. **Format drift is checked, not assumed.** `ai-cache-bar.py --compat` holds
+    the list of what the script reads (`CLAUDE_NEEDLES`, `CODEX_NEEDLES`, and the
+    local-data checks). When the script starts reading a new field, add it there
+    too, with what it serves and whether losing it is fatal. The app runs it at
+    launch and daily (after `--calibrate`, never overlapping it) and notifies once
+    per `key` (the tool versions); `upstream-compat.yml` runs the needles weekly
+    against the newest npm builds of Claude Code and Codex.
+15. **The app checks for updates, never installs them.** Daily, the GitHub
+    release API's `latest`, announced once per version (`updateNotified`).
+    Sparkle stays out until releases are Developer ID signed and notarized.
+16. **Polling is the clock, FSEvents is a shortcut.** `ChatWatcher` refreshes
+    when a non-subagent `.jsonl` under `~/.claude/projects` or
+    `~/.codex/sessions` changes. State still changes with time alone, so the
+    15 s poll stays. The script never writes under those folders (the e2e suite
+    checks), or the watch would loop.
 
 ## Commands
 
@@ -128,8 +150,13 @@ files, title cache). Everything is driven by a fixture HOME instead:
   Test hooks: `CACHEBAR_DEBUG=1` (one `python:`/`poll:`/`notify:`/`error:` line
   per event on stderr), `CACHEBAR_NO_BANNERS=1` (log, don't deliver),
   `CACHEBAR_TIME_SCALE=N` (poll N× as often), `CACHEBAR_SCRIPT`,
-  `CACHEBAR_PYTHON`, `CACHEBAR_TEST_NOTIFICATION=1`. `tests/e2e.sh` and
-  `tests/demo.sh` are the worked examples.
+  `CACHEBAR_PYTHON`, `CACHEBAR_TEST_NOTIFICATION=1`, `CACHEBAR_TEST_INBOX=FILE`
+  (actions read each tick: `refresh`, `test notification`, `sleep`, `wake`,
+  `unlock`, `click`, `check updates`, `compat`, `settings`),
+  `CACHEBAR_UPDATE_URL` (a `file://` release JSON) and `CACHEBAR_OPEN_DRY_RUN=1`
+  (log pages instead of opening them). `tests/e2e.sh` runs offline by default
+  (the update feed is a missing file). It and `tests/demo.sh` are the worked
+  examples.
 
 ## Hazards
 

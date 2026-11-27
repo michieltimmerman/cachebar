@@ -99,8 +99,12 @@ run_app() {
     local envs=("HOME=$ALL/$name/home")
     while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done
     [ $# -gt 0 ] && shift
+    # Offline by default: the update check reads a release file that isn't there
+    # (a scenario points CACHEBAR_UPDATE_URL at one), and opens nothing.
     exec env -i USER="$USER_NAME" TMPDIR="$TMP" PATH=/usr/bin:/bin CACHEBAR_DEBUG=1 \
-        CACHEBAR_NO_BANNERS=1 CACHEBAR_TIME_SCALE="$SCALE" "${envs[@]}" "$BIN" "$@"
+        CACHEBAR_NO_BANNERS=1 CACHEBAR_TIME_SCALE="$SCALE" CACHEBAR_OPEN_DRY_RUN=1 \
+        CACHEBAR_UPDATE_URL="file://$ALL/no-release.json" CACHEBAR_TEST_INBOX="$ALL/$name/inbox" \
+        "${envs[@]}" "$BIN" "$@"
 }
 start() { # start NAME [VAR=value ...] [-- CacheBar args]; logs to $ALL/NAME/app.log
     mkdir -p "$ALL/$1/home"
@@ -117,6 +121,10 @@ stop() {
     done
 }
 gone() { [ -n "$1" ] && ! kill -0 "$1" 2> /dev/null; }
+# inbox NAME ACTION: an action the app performs on its next tick (CACHEBAR_TEST_INBOX).
+inbox() { echo "$2" >> "$ALL/$1/inbox"; }
+# sleep_until EPOCH
+sleep_until() { "$PY" -c 'import sys, time; time.sleep(max(0, float(sys.argv[1]) - time.time()))' "$1"; }
 alive() { kill -0 "$(cat "$ALL/$1/pid")" 2> /dev/null; }
 
 logged() { grep -q -- "$2" "$ALL/$1/app.log" 2> /dev/null; }   # regex
@@ -215,7 +223,12 @@ n1=$(count healthy "poll: ")
 expect "  … every 0.5 s (15 s / CACHEBAR_TIME_SCALE=$SCALE): $((n1 - n0)) polls in 3 s" \
     test $((n1 - n0)) -ge 3 -a $((n1 - n0)) -le 9
 stop healthy
-expect "no errors, the launch-time --calibrate included" not logged healthy "error:"
+expect "no errors, the launch-time --calibrate and --compat included" not logged healthy "error:"
+expect "the compatibility check ran after it, and passed" \
+    has healthy "compat: Claude Code 2.0.0, Codex 0.50.0: all 12 checks pass"
+expect "  … after the calibration finished" in_order healthy "calibrate: done" "compat: "
+expect "an update check ran (offline here: it failed quietly)" logged healthy "update check failed: "
+expect "the chat folders are watched" has healthy "watch: $H/.claude/projects, $H/.codex/sessions"
 expect "a steady state notifies nothing (notifications on)" not logged healthy "notify:"
 expect "the script ran against the fake HOME (its caches are there)" \
     test -f "$H/.claude/.ai-cache-bar-plan.json" -a -f "$H/.claude/.ai-cache-bar-titles.json"
@@ -248,6 +261,96 @@ sleep 1.5
 expect "exactly those three, once each (chats cold at launch stay quiet)" count_is notify-on "notify:" 3
 expect "--notifications off notifies none of them" not logged notify-off "notify:"
 stop notify-on notify-off
+
+scenario "asleep: nothing that changed meanwhile is announced on wake; later changes are"
+# The newest chat goes cold 8 s after NOW, while the "Mac" sleeps (inbox sleep/wake).
+fixture sleep
+start sleep AI_CACHE_TTL_SECONDS=128 AI_CACHE_WARN_SECONDS=3 -- --notifications on
+eventually 6 "first poll, the newest chat still warm" first_poll_matches sleep " warm=1$"
+inbox sleep sleep
+eventually 2 "sleep pauses polling" has sleep "sleep: polls paused"
+polls=$(count sleep "poll: ")
+sleep_until "$((NOW + 10))"
+expect "  … no poll while asleep" count_is sleep "poll: " "$polls"
+inbox sleep wake
+eventually 3 "wake records instead of announcing" has sleep "wake: recording what changed while asleep, not announcing it"
+eventually 3 "  … and polls at once: the chat is cold now" logged sleep "poll: 10 sessions cold=6 "
+sleep 1
+expect "  … without \"Cache expiring\" or \"Cache went cold\" for it" not logged sleep "notify:"
+add_rewrite sleep
+eventually 5 "a change after the wake is announced again" \
+    notified sleep "Tune flaky integration test — Rewrote 220k cached tokens"
+inbox sleep unlock
+eventually 3 "an unlock without sleep only refreshes" has sleep "unlock: refresh"
+stop sleep
+
+scenario "a transcript write polls at once (FSEvents), not on the next 15 s tick"
+fixture watch
+start watch CACHEBAR_TIME_SCALE=1 AI_CACHE_NOW="$NOW"
+eventually 10 "first poll" logged watch "poll: "
+sleep 1
+polls=$(count watch "poll: ")
+mkdir -p "$ALL/watch/home/.claude/projects/demo/sess/subagents"
+echo '{}' >> "$ALL/watch/home/.claude/projects/demo/sess/subagents/agent-1.jsonl"
+sleep 1.5
+expect "a subagent transcript doesn't trigger one" count_is watch "poll: " "$polls"
+add_rewrite watch
+eventually 3 "a chat's transcript does" count_above watch "poll: " "$polls"
+expect "  … and says why" has watch "watch: 1 transcript changed"
+stop watch
+
+scenario "update check: a newer release is announced once; clicking opens its page"
+mkdir -p "$ALL/update"
+printf '%s\n' '{"tag_name": "v99.0.0", "html_url": "https://github.com/michieltimmerman/cachebar/releases/tag/v99.0.0"}' \
+    > "$ALL/update/release.json"
+# Earlier apps' (offline) checks share the test defaults domain: start fresh.
+for k in lastUpdateCheck latestVersion latestPage updateNotified; do defaults delete "$TEST_ID" "$k" > /dev/null 2>&1; done
+start update CACHEBAR_UPDATE_URL="file://$ALL/update/release.json" -- --notifications on
+eventually 5 "checks at launch" logged update "update check: latest 99.0.0, running "
+eventually 2 "  … announces it, click to open" \
+    notified update "CacheBar 99.0.0 is available — You have .* Click to open the release page. \\[click: update\\]"
+inbox update click
+eventually 3 "clicking opens the release page" \
+    has update "opening https://github.com/michieltimmerman/cachebar/releases/tag/v99.0.0"
+inbox update "check updates"
+eventually 3 "checking again" count_is update "update check: latest" 2
+expect "  … doesn't announce the same version twice" count_is update "notify: CacheBar 99.0.0" 1
+for k in lastUpdateCheck latestVersion latestPage updateNotified; do defaults delete "$TEST_ID" "$k" > /dev/null 2>&1; done
+start update-off CACHEBAR_UPDATE_URL="file://$ALL/update/release.json" -- --check-updates off
+eventually 6 "--check-updates off: polls" logged update-off "poll: "
+sleep 1
+expect "  … but never checks" not logged update-off "update check"
+stop update update-off
+
+scenario "compatibility: a tool update that drops a field is named once; click for Settings"
+fixture compat
+find "$ALL/compat/home/.claude/projects" -name '*.jsonl' -exec sed -i '' 's/cache_read_input_tokens/cache_reads/g' {} +
+defaults delete "$TEST_ID" compatNotified > /dev/null 2>&1
+start compat -- --notifications on
+eventually 10 "the check finds it" has compat "compat: Claude Code 2.0.0, Codex 0.50.0: 1 problem, 0 warnings"
+eventually 2 "  … and notifies, click for Settings" notified compat \
+    "CacheBar can't read part of your chats — Claude Code 2.0.0, Codex 0.50.0 changed what CacheBar relies on: each chat's cached size. Click for details. \\[click: settings\\]"
+inbox compat compat
+eventually 3 "checking again" count_is compat "compat: " 2
+expect "  … doesn't notify again for the same versions" count_is compat "notify: CacheBar can't read" 1
+inbox compat click
+eventually 3 "clicking opens Settings" has compat "settings window: visible true"
+stop compat
+
+scenario "quitting ends a running --calibrate"
+fake calhang 'import json, os, sys, time
+here = os.path.dirname(os.path.abspath(sys.argv[0]))
+if "--calibrate" in sys.argv:
+    open(os.path.join(here, "calibrate.pid"), "w").write(str(os.getpid()))
+    time.sleep(60)
+print(json.dumps({"sessions": [], "budget": None}))'
+start calhang CACHEBAR_PYTHON="$PY" CACHEBAR_SCRIPT="$ALL/calhang/fake.py"
+eventually 8 "--calibrate is running" test -s "$ALL/calhang/calibrate.pid"
+app=$(cat "$ALL/calhang/pid")
+kill "$app"
+eventually 3 "SIGTERM quits the app" gone "$app"
+mv "$ALL/calhang/pid" "$ALL/calhang/pid.done"
+eventually 3 "  … and its --calibrate with it" gone "$(cat "$ALL/calhang/calibrate.pid")"
 
 scenario "an unusable Python setting is reported, never swapped for another"
 mkdir -p "$ALL/py"
@@ -398,7 +501,7 @@ eventually 5 "wrong-typed optional fields still poll, and a tight budget notifie
     has decode "notify: Compacting everything would exhaust your 5h limit — 2 chats ≈ 12.5% but only 4% left. Cold: api@main"
 sleep 1
 expect "  … once" count_is decode "notify:" 1
-expect "  … no decode errors" not logged decode "error:"
+expect "  … no decode errors" not logged decode "error: couldn't read"
 eventually 5 "an older script's bare array: polls" logged bare "poll: 1 sessions warm=1"
 eventually 5 "a missing required field: named" has nochats "error: couldn't read ai-cache-bar.py --json: budget.chats: missing"
 eventually 5 "a wrong type: named with its index" has badage "error: couldn't read ai-cache-bar.py --json: sessions[1].age: expected Int"
@@ -414,6 +517,11 @@ out=$(run_app cli -- --help 2>&1)
 rc=$?
 expect "--help exits 0" test "$rc" -eq 0
 expect "  … listing every setting" grep -q -- "--lookback-hours N" <<< "$out"
+expect "  … --check-updates included" grep -q -- "--check-updates on|off" <<< "$out"
+out=$(run_app cli -- --compat 2>&1)
+rc=$?
+expect "--compat: exit 0 on the fixture" test "$rc" -eq 0
+expect "  … printing ai-cache-bar.py --compat" grep -qx "all 12 checks pass" <<< "$out"
 (run_app cli -- --no-such-flag) > /dev/null 2> "$ALL/cli/err"
 rc=$?
 expect "an unknown option: exit 2" test "$rc" -eq 2

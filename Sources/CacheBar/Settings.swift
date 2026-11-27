@@ -70,6 +70,56 @@ struct SettingsView: View {
             }
 
             Section {
+                LabeledContent("Status") {
+                    if let c = monitor.compat {
+                        VStack(alignment: .trailing) {
+                            Text(c.summary)
+                                .foregroundStyle(c.failures > 0 ? .red : c.warnings > 0 ? .orange : .primary)
+                            if !c.key.isEmpty { Text(c.key).foregroundStyle(.secondary) }
+                        }
+                    } else if let p = monitor.compatProblem {
+                        Text(p).foregroundStyle(.red).lineLimit(2)
+                    } else {
+                        Text("Not checked yet").foregroundStyle(.secondary)
+                    }
+                }
+                ForEach(Array((monitor.compat?.problems ?? []).enumerated()), id: \.offset) { _, item in
+                    VStack(alignment: .leading) {
+                        Text("\(item.fatal ? "⚠️" : "ⓘ") \(item.serves)")
+                        Text(item.detail).foregroundStyle(.secondary)
+                    }
+                }
+                Button("Check again") { monitor.checkCompat() }
+            } header: {
+                Text("Compatibility")
+            } footer: {
+                Text("Claude Code, the Claude app and Codex can change the files CacheBar reads without notice. "
+                     + "CacheBar checks them at launch and daily, and notifies once per tool version when "
+                     + "something it relies on is gone.")
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Check for updates daily",
+                       isOn: effective(overrides.checkUpdates, $monitor.prefs.checkUpdates))
+                    .disabled(overrides.checkUpdates != nil)
+                ArgumentNote(flag: "--check-updates", active: overrides.checkUpdates != nil)
+                HStack {
+                    Text(monitor.updateStatus ?? "Running \(appVersion)").foregroundStyle(.secondary)
+                    Spacer()
+                    if let u = monitor.availableUpdate {
+                        Button("Open \(u.version) release page") { Updates.open(u.page) }
+                    }
+                    Button("Check now") { monitor.checkForUpdates() }
+                }
+            } header: {
+                Text("Updates")
+            } footer: {
+                Text("Asks GitHub for the latest release; nothing is downloaded or installed.")
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
                 Toggle("Launch at login", isOn: Binding(
                     get: { monitor.launchAtLogin },
                     set: { monitor.setLaunchAtLogin($0) }))
@@ -89,7 +139,7 @@ struct SettingsView: View {
         .formStyle(.grouped)
         // A grouped Form scrolls and has no ideal height of its own; without a
         // fixed size the window shrinks to nothing.
-        .frame(width: 540, height: 620)
+        .frame(width: 560, height: 720)
     }
 
     @ViewBuilder private var pythonStatus: some View {

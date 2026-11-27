@@ -8,6 +8,7 @@ import Foundation
 struct Overrides {
     var python: String?
     var notifications: Bool?
+    var checkUpdates: Bool?
     var warnMinutes: Int?
     var maxRows: Int?
     var lookbackHours: Int?
@@ -25,7 +26,7 @@ struct Overrides {
 
 struct Arguments {
     enum Command: Equatable {
-        case run, help, version, status
+        case run, help, version, status, compat
     }
 
     var command = Command.run
@@ -36,6 +37,7 @@ struct Arguments {
     static let options: [(flag: String, value: String, help: String)] = [
         ("--python", "PATH", "python3 to run ai-cache-bar.py with"),
         ("--notifications", "on|off", "show notifications"),
+        ("--check-updates", "on|off", "look for a newer CacheBar once a day"),
         ("--warn-minutes", "N", "warn N minutes before a chat goes cold"),
         ("--max-rows", "N", "chats listed in the menu"),
         ("--lookback-hours", "N", "list chats active in the last N hours"),
@@ -49,7 +51,7 @@ struct Arguments {
         }
         return """
         Usage: CacheBar [options]
-               CacheBar --status | --version | --help
+               CacheBar --status | --compat | --version | --help
 
         Settings for this run (they win over the environment and the Settings window,
         and are not saved):
@@ -57,6 +59,8 @@ struct Arguments {
 
         Commands:
           --status   the Python CacheBar would use, then ai-cache-bar.py --text
+          --compat   whether your chats' files still have what CacheBar reads
+                     (ai-cache-bar.py --compat; exit 1 on a problem)
           --version  print the version
           --help     this text
 
@@ -93,8 +97,10 @@ struct Arguments {
             case "--help", "-h": a.command = .help
             case "--version": a.command = .version
             case "--status": a.command = .status
+            case "--compat": a.command = .compat
             case "--python": a.overrides.python = try path(value(), arg)
             case "--notifications": a.overrides.notifications = try bool(value(), arg)
+            case "--check-updates": a.overrides.checkUpdates = try bool(value(), arg)
             case "--warn-minutes": a.overrides.warnMinutes = try count(value(), arg)
             case "--max-rows": a.overrides.maxRows = try count(value(), arg)
             case "--lookback-hours": a.overrides.lookbackHours = try count(value(), arg)

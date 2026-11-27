@@ -133,9 +133,15 @@ from the last five hours. Extra lines appear while the budget still uses the
 default calibration, and when a limit is capping you right now (with its reset
 time).
 
+The menu reads your chats every 15 seconds, and at once when a chat's transcript
+changes (an FSEvents watch on `~/.claude/projects` and `~/.codex/sessions`), so a
+new turn resets its countdown right away.
+
 The items are **Launch at login**, **Refresh now**, **Send test notification**,
-**Settings…** (⌘,) and **Quit CacheBar**. The rows themselves can't be clicked;
-see [Why nothing is clickable](#why-nothing-is-clickable).
+**Settings…** (⌘,) and **Quit CacheBar**, plus **CacheBar X is available…** when
+the update check found a newer release, and a warning line when the
+[compatibility check](#compatibility-check) found a problem. The rows themselves
+can't be clicked; see [Why chats aren't clickable](#why-chats-arent-clickable).
 
 ## Notifications
 
@@ -144,6 +150,14 @@ newer banner replaces its own older one. They fire only for Claude chats idle
 less than two hours, only on changes (never for what was already true at launch),
 and never for codex estimates. Turn them off in Settings or with
 `--notifications off`.
+
+Chats that went cold while the Mac slept are recorded on wake, not announced:
+CacheBar pauses its polls at sleep and treats the wake like a launch. An unlock
+without sleep only refreshes the menu.
+
+Two notifications are not about a chat, and those can be clicked: a newer
+release (opens its release page) and a compatibility problem (opens Settings).
+Each is sent once, per version.
 
 How a banner is delivered:
 
@@ -171,10 +185,16 @@ always uses `osascript`, so its banners don't replace each other per chat.
   chats are listed.
 - **Python**: the one in use and where it came from, an **Override** (Choose… /
   Clear) and **Detect again**.
+- **Compatibility**: the latest [compatibility check](#compatibility-check), what
+  it found, and **Check again**.
+- **Updates**: **Check for updates daily** (default on), the last result, and
+  **Check now**. It asks GitHub for the latest release and nothing else: nothing
+  is downloaded or installed.
 - **Launch at login**, and the version.
 
 Settings are saved in the app's defaults (`com.michieltimmerman.cachebar`, keys
-`notifications`, `warnMinutes`, `maxRows`, `lookbackHours`, `CACHEBAR_PYTHON`), so
+`notifications`, `checkUpdates`, `warnMinutes`, `maxRows`, `lookbackHours`,
+`CACHEBAR_PYTHON`), so
 `defaults write` works too. The numbers reach the script as its `AI_CACHE_*`
 variables.
 
@@ -193,6 +213,7 @@ open -a CacheBar --args --warn-minutes 5 --max-rows 15
 |---|---|---|
 | `--python PATH` | Python override | `CACHEBAR_PYTHON` |
 | `--notifications on\|off` | Notifications | |
+| `--check-updates on\|off` | Check for updates daily | |
 | `--warn-minutes N` | Warn before a chat goes cold | `AI_CACHE_WARN_SECONDS` (seconds) |
 | `--max-rows N` | Rows in the menu | `AI_CACHE_MAX_ROWS` |
 | `--lookback-hours N` | Look back | `AI_CACHE_LOOKBACK_MIN` (minutes) |
@@ -200,6 +221,8 @@ open -a CacheBar --args --warn-minutes 5 --max-rows 15
 Commands that print something and exit:
 - `--status`: the Python CacheBar would use, its settings, then
   `ai-cache-bar.py --text`;
+- `--compat`: the [compatibility check](#compatibility-check) on your data (exit 1
+  on a problem);
 - `--version` and `--help`.
 
 ## Finding Python
@@ -256,6 +279,8 @@ App only:
 | `CACHEBAR_NO_BANNERS=1` | log notifications (with `CACHEBAR_DEBUG`) but deliver none |
 | `CACHEBAR_TIME_SCALE=N` | poll N× as often (tests) |
 | `CACHEBAR_TEST_NOTIFICATION=1` | send one test notification a few seconds after launch |
+| `CACHEBAR_TEST_INBOX=FILE` | tests: actions read from FILE each tick (`refresh`, `test notification`, `sleep`, `wake`, `unlock`, `click`, `check updates`, `compat`, `settings`) |
+| `CACHEBAR_UPDATE_URL`, `CACHEBAR_OPEN_DRY_RUN=1` | tests: the release feed to check (a `file://` JSON works), and only log pages instead of opening them |
 | `CACHEBAR_BUNDLE_ID`, `CODESIGN_IDENTITY`, `VERSION`, `UNIVERSAL=1`, `SHARED=1` | build time (`packaging/build.sh`): bundle id, signing identity, version, universal binary; `SHARED=1` (dist, releases) refuses any identity but a Developer ID or ad-hoc |
 
 ## Data sources
@@ -372,11 +397,29 @@ line's `session_id`. Chat names (auto-generated and user renames alike) live in
 `~/.codex/session_index.jsonl` as `thread_name`, keyed by that same id; unnamed
 chats fall back to a cwd@branch label.
 
-## Why nothing is clickable
+## Compatibility check
 
-Rows and notifications are information, not actions: there is no safe deep link
-into an existing desktop-app chat, so there is nothing useful to open. Both routes
-in the app were tried:
+Everything CacheBar shows comes from files Claude Code, the Claude app and Codex
+write for themselves, with no promise they stay the same. `ai-cache-bar.py
+--compat` checks that they still have what it reads: turn usage with cache
+fields, the cache tier, request and message ids, titles, plan-usage samples, and
+Codex's session and token-count events. A failure disables something, a warning
+only weakens it (no titles, every chat assumed to use the 1-hour tier).
+
+- The app runs it at launch and daily, shows it in Settings, and notifies once per
+  Claude Code and Codex version when something it relies on is gone.
+- `mise run compat` or `CacheBar --compat` prints it.
+- `ai-cache-bar.py --compat claude:PATH codex:PATH` checks a tool's executable for
+  the field names instead. The weekly `upstream-compat` workflow runs that
+  against the newest npm releases of both, so a release that renames a field
+  turns that workflow red before your countdowns go wrong.
+
+## Why chats aren't clickable
+
+Rows and chat notifications are information, not actions: there is no safe deep
+link into an existing desktop-app chat, so there is nothing useful to open. (The
+update and compatibility notifications open a web page or Settings, which is
+safe.) Both chat routes in the app were tried:
 
 - `claude://code/continue?session=local_<uuid>` has the right semantics but its
   handler is behind an account feature gate that silently returns
@@ -393,7 +436,7 @@ in the app were tried:
 | Path | What it is |
 |---|---|
 | `ai-cache-bar.py` | The single source of truth: collects sessions, derives state, titles and the plan budget. Emits `--json` (what the app reads), `--text`, `--swiftbar`, `--notify`, `--calibrate`. Stdlib-only Python. |
-| `Sources/CacheBar/` | The app, a plain SwiftPM executable: `CacheBar.swift` (menu, polling, notifications), `Python.swift` (finding Python, running the script), `Settings.swift` (Settings window), `Arguments.swift` (command line). All logic stays in the Python so the rules never fork between surfaces. `xed .` opens it in Xcode. |
+| `Sources/CacheBar/` | The app, a plain SwiftPM executable: `CacheBar.swift` (menu, polling, notifications, sleep and wake), `Python.swift` (finding Python, running the script), `Settings.swift` (Settings window), `Arguments.swift` (command line), `Watch.swift` (refresh on transcript writes), `Updates.swift` (the daily release check). All logic stays in the Python so the rules never fork between surfaces. `xed .` opens it in Xcode. |
 | `packaging/build.sh` | Release-builds via SwiftPM and assembles `CacheBar.app`: Info.plist, icon, signing, and `ai-cache-bar.py` bundled into Resources. |
 | `packaging/release.sh`, `release-secrets.sh` | Cutting a release (see [Releasing](#releasing)). |
 | `packaging/make-icns.sh`, `render-icon.swift` | Regenerate the committed `CacheBar.icns` (only when the design changes). |
@@ -421,9 +464,14 @@ mise run dist       # dist/CacheBar.zip: universal, ad-hoc unless CODESIGN_IDENT
   default, env), plus contract checks the goldens can't override. The goldens are
   the reference for a future Swift port of the script. `--update` rewrites them
   after an intended change; `PYTHON=…` picks the interpreter.
-- **`tests/e2e.sh`** runs the real app binary against a fixture HOME.
-- **CI**: `.github/workflows/ci.yml` builds a universal app and runs both suites
-  on every push to `main` and every pull request.
+- **`tests/e2e.sh`** runs the real app binary against a fixture HOME, polling 30×
+  faster, offline (the update check reads a local file) and driven through a test
+  inbox file for what a script can't do: clicking a notification, sleep and wake.
+- **CI**: `.github/workflows/ci.yml` builds a universal app, runs its `--status`
+  and `--compat` self-checks on a fixture HOME, and runs both suites on every push
+  to `main` and every pull request. `.github/workflows/upstream-compat.yml` runs
+  the [compatibility check](#compatibility-check) weekly against the newest
+  Claude Code and Codex.
 
 ## Releasing
 

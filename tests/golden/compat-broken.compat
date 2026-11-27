@@ -1,0 +1,17 @@
+Claude Code: 2.0.0
+Codex: 0.50.0
+plan usage: 2
+  ok    claude  turns with token usage are found
+  FAIL  claude  each chat's cached size — usage has no cache_read_input_tokens / cache_creation_input_tokens in the newest 16 transcripts
+  ok    claude  countdowns (turn timestamps)
+  ok    claude  turns are told apart (requestId)
+  ok    claude  token totals are deduplicated (message.id)
+  ok    claude  the cache tier (1 hour or 5 minutes) is read
+  ok    claude  subagent turns stay out of the chat rows
+  ok    claude  chat titles
+  ok    plan    plan usage (% of the 5-hour and 7-day limits)
+  ok    codex   a resumed Codex chat stays one row
+  ok    codex   Codex turns and cached sizes
+  ok    codex   Codex chat names
+
+1 problem, 0 warnings

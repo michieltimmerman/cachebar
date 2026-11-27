@@ -28,6 +28,10 @@ run = "packaging/make-icns.sh"
 description = "One-line-per-session cache summary in the terminal"
 run = "./ai-cache-bar.py --text"
 
+[tasks.compat]
+description = "Check that your Claude Code, Claude app and Codex files still have what CacheBar reads"
+run = "./ai-cache-bar.py --compat"
+
 [tasks.json]
 description = "Machine-readable sessions + plan budget"
 run = "./ai-cache-bar.py --json"

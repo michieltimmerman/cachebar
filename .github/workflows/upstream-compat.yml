@@ -1,0 +1,39 @@
+name: Upstream compatibility
+
+# ai-cache-bar.py reads files Claude Code and Codex write for themselves, with no
+# contract behind them (AGENTS.md). Every week, check that the newest releases of
+# both still contain the field names the script relies on, so a release that
+# renames one shows up here before the countdowns quietly go wrong.
+# The needles live in the script (CLAUDE_NEEDLES, CODEX_NEEDLES); this only
+# fetches the executables: the macOS arm64 builds from npm.
+
+on:
+  schedule:
+    - cron: "23 6 * * 1"   # Mondays 06:23 UTC
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [ai-cache-bar.py, .github/workflows/upstream-compat.yml]
+
+jobs:
+  check:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download the newest Claude Code and Codex
+        run: |
+          claude=$(npm view @anthropic-ai/claude-code version)
+          codex=$(npm view @openai/codex version)
+          echo "Claude Code $claude, Codex $codex"
+          mkdir -p "$RUNNER_TEMP/claude" "$RUNNER_TEMP/codex"
+          (cd "$RUNNER_TEMP/claude" \
+            && tar -xzf "$(npm pack --silent "@anthropic-ai/claude-code-darwin-arm64@$claude")")
+          (cd "$RUNNER_TEMP/codex" \
+            && tar -xzf "$(npm pack --silent "@openai/codex@$codex-darwin-arm64")")
+
+      - name: Check what ai-cache-bar.py relies on
+        run: |
+          python3 ai-cache-bar.py --compat \
+            "claude:$RUNNER_TEMP/claude/package" "codex:$RUNNER_TEMP/codex/package"

@@ -229,6 +229,29 @@ func describe(_ error: Error) -> String {
 
 // MARK: - Notifications
 
+/// What clicking a notification does. Never "open the chat": no deep link into an
+/// existing chat is safe (AGENTS.md, Hazards), so chat notifications carry none.
+enum NoteAction: String {
+    /// Open the newer release's page.
+    case update
+    case settings
+
+    static let key = "cachebar-action"
+
+    func perform() {
+        debug("notification clicked: \(rawValue)")
+        switch self {
+        case .update: Monitor.shared.availableUpdate.map { Updates.open($0.page) }
+        case .settings: SettingsWindow.shared.show()
+        }
+    }
+
+    init?(userInfo: [AnyHashable: Any]?) {
+        guard let raw = userInfo?[Self.key] as? String else { return nil }
+        self.init(rawValue: raw)
+    }
+}
+
 final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     static let shared = Notifier()
 
@@ -236,6 +259,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     /// The user turned CacheBar's notifications down in the native prompt: respect
     /// that rather than reaching them through the deprecated center instead.
     private var declined = false
+    /// Test hook: the inbox's "click" performs the last notification's action.
+    private(set) var lastAction: NoteAction?
 
     func requestAuthorization() {
         guard Bundle.main.bundleIdentifier != nil else {
@@ -263,19 +288,22 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
     /// One `group` per session: a session's newer banner replaces its own earlier
     /// one, never another session's.
-    func post(title: String, body: String, group: String = "cachebar") {
-        debug("notify: \(title) — \(body)")
+    func post(title: String, body: String, group: String = "cachebar", action: NoteAction? = nil) {
+        debug("notify: \(title) — \(body)" + (action.map { " [click: \($0.rawValue)]" } ?? ""))
+        lastAction = action
         if noBanners || declined { return }
+        let info: [String: Any] = action.map { [NoteAction.key: $0.rawValue] } ?? [:]
         if useNative {
             let content = UNMutableNotificationContent()
             content.title = title
             content.body = body
+            content.userInfo = info
             UNUserNotificationCenter.current().add(
                 UNNotificationRequest(identifier: group, content: content, trigger: nil))
             return
         }
         if Bundle.main.bundleIdentifier != nil {
-            LegacyNotifier.shared.post(title: title, body: body, group: group)
+            LegacyNotifier.shared.post(title: title, body: body, group: group, info: info)
             return
         }
         // Title and body travel as arguments, never inside the script text, so a
@@ -296,7 +324,19 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completion:
                                     @escaping (UNNotificationPresentationOptions) -> Void) {
-        completion([.banner, .sound])
+        completion([.banner, .sound, .list])
+    }
+
+    /// A click on the banner, or on it in Notification Center.
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completion: @escaping () -> Void) {
+        let action = response.actionIdentifier == UNNotificationDefaultActionIdentifier
+            ? NoteAction(userInfo: response.notification.request.content.userInfo) : nil
+        DispatchQueue.main.async {
+            action?.perform()
+            completion()
+        }
     }
 }
 
@@ -307,12 +347,13 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 final class LegacyNotifier: NSObject, NSUserNotificationCenterDelegate {
     static let shared = LegacyNotifier()
 
-    func post(title: String, body: String, group: String) {
+    func post(title: String, body: String, group: String, info: [String: Any]) {
         let center = NSUserNotificationCenter.default
         center.delegate = self
         let note = NSUserNotification()
         note.title = title
         note.informativeText = body
+        note.userInfo = info
         // As with UNNotificationRequest's identifier, a newer notification
         // replaces the one still showing from the same group.
         note.identifier = group
@@ -324,6 +365,12 @@ final class LegacyNotifier: NSObject, NSUserNotificationCenterDelegate {
                                 shouldPresent notification: NSUserNotification) -> Bool {
         true
     }
+
+    func userNotificationCenter(_ center: NSUserNotificationCenter,
+                                didActivate notification: NSUserNotification) {
+        guard let action = NoteAction(userInfo: notification.userInfo) else { return }
+        DispatchQueue.main.async { action.perform() }
+    }
 }
 
 // MARK: - Settings values
@@ -332,6 +379,7 @@ final class LegacyNotifier: NSObject, NSUserNotificationCenterDelegate {
 /// com.michieltimmerman.cachebar`). A nil number leaves the script's own default.
 struct Prefs: Equatable {
     var notify = true
+    var checkUpdates = true
     var warnMinutes: Int?
     var maxRows: Int?
     var lookbackHours: Int?
@@ -346,6 +394,7 @@ struct Prefs: Equatable {
         }
         var p = Prefs()
         if d.object(forKey: "notifications") != nil { p.notify = d.bool(forKey: "notifications") }
+        if d.object(forKey: "checkUpdates") != nil { p.checkUpdates = d.bool(forKey: "checkUpdates") }
         p.warnMinutes = number("warnMinutes")
         p.maxRows = number("maxRows")
         p.lookbackHours = number("lookbackHours")
@@ -355,6 +404,7 @@ struct Prefs: Equatable {
     func save() {
         let d = UserDefaults.standard
         d.set(notify, forKey: "notifications")
+        d.set(checkUpdates, forKey: "checkUpdates")
         for (key, value) in [("warnMinutes", warnMinutes), ("maxRows", maxRows), ("lookbackHours", lookbackHours)] {
             if let value { d.set(value, forKey: key) } else { d.removeObject(forKey: key) }
         }
@@ -363,6 +413,7 @@ struct Prefs: Equatable {
     // What the app acts on: a command-line argument wins (Arguments.swift), then the
     // environment, then the saved setting. Never saved.
     var notifies: Bool { overrides.notifications ?? notify }
+    var checksUpdates: Bool { overrides.checkUpdates ?? checkUpdates }
 
     var warn: Knob {
         Knob(flag: "--warn-minutes", env: "AI_CACHE_WARN_SECONDS", scale: 60, envSeconds: 1,
@@ -462,6 +513,31 @@ enum PollResult {
     }
 }
 
+/// `ai-cache-bar.py --compat --json`: whether the files Claude Code, the desktop
+/// app and Codex write still have what the script reads. The script decides; the
+/// app only shows it.
+struct CompatReport: Decodable {
+    struct Item: Decodable {
+        let tool: String
+        let ok: Bool
+        let fatal: Bool
+        let serves: String
+        let detail: String
+    }
+
+    let items: [Item]
+    let failures: Int
+    let warnings: Int
+    /// What was checked, e.g. "Claude Code 2.1.325, Codex 0.153.4".
+    let key: String
+    let summary: String
+
+    var problems: [Item] { items.filter { !$0.ok } }
+}
+
+/// The once-a-day checks run at most this often (scaled for tests).
+let dailyEvery: TimeInterval = 24 * 3600 / timeScale
+
 final class Monitor: ObservableObject {
     static let shared = Monitor()
 
@@ -485,6 +561,17 @@ final class Monitor: ObservableObject {
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     /// Why Launch at login isn't on, when macOS said no.
     @Published var launchAtLoginNote: String?
+    /// The latest --compat report, and why the last run gave none.
+    @Published var compat: CompatReport?
+    @Published var compatProblem: String?
+    /// The latest release the update check saw, and its outcome for Settings.
+    @Published var latest: Release? = {
+        let d = UserDefaults.standard
+        guard let v = d.string(forKey: "latestVersion"),
+              let page = d.string(forKey: "latestPage").flatMap(URL.init(string:)) else { return nil }
+        return Release(version: v, page: page)
+    }()
+    @Published var updateStatus: String?
 
     private var dataTitle = "🫥"
     private var lastState: [String: String] = [:]
@@ -500,10 +587,41 @@ final class Monitor: ObservableObject {
     private var locateAgain = false
     private var calibrating = false
     private var lastCalibration: Date?
+    private var checkingCompat = false
+    private var checkingUpdates = false
+    /// Between the Mac's willSleep and didWake: no polls, so nothing that changed
+    /// while asleep is announced (didWake records it instead).
+    private var asleep = false
+    /// The last wake. A poll that started before it saw the Mac before sleep, so
+    /// it records quietly and leaves the next poll to seed from.
+    private var wokeAt: Date?
     private var timer: Timer?
+    private lazy var watcher = ChatWatcher { [weak self] in self?.refresh() }
+    private var sigterm: DispatchSourceSignal?
 
     func start() {
         Notifier.shared.requestAuthorization()
+        let ws = NSWorkspace.shared.notificationCenter
+        ws.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) {
+            [weak self] _ in self?.wentToSleep()
+        }
+        ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) {
+            [weak self] _ in self?.cameBack(fromSleep: true)
+        }
+        DistributedNotificationCenter.default().addObserver(
+            forName: .init("com.apple.screenIsUnlocked"), object: nil, queue: .main
+        ) { [weak self] _ in self?.cameBack(fromSleep: false) }
+        // A running --calibrate (or poll) must not outlive the app.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { _ in terminateRunningTools() }
+        signal(SIGTERM, SIG_IGN)
+        sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        sigterm?.setEventHandler {
+            terminateRunningTools()
+            exit(0)
+        }
+        sigterm?.resume()
         if Bundle.main.bundlePath.contains("/AppTranslocation/") {
             launchAtLoginNote = "Move CacheBar to Applications to enable Launch at login"
         }
@@ -514,12 +632,19 @@ final class Monitor: ObservableObject {
         if appEnv["CACHEBAR_TEST_NOTIFICATION"] == "1" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.sendTestNotification() }
         }
+        watcher.update()
         timer = Timer.scheduledTimer(withTimeInterval: pollEvery, repeats: true) { [weak self] _ in
             self?.tick()
         }
     }
 
     private func tick() {
+        readInbox()
+        watcher.update()
+        if prefs.checksUpdates, !asleep,
+           lastUpdateCheck.map({ Date().timeIntervalSince($0) >= updateCheckEvery }) ?? true {
+            checkForUpdates()
+        }
         switch python {
         case .found: poll()
         case .locating: break
@@ -578,7 +703,7 @@ final class Monitor: ObservableObject {
     /// in `Prefs.scriptEnv`), because a scan of a large history could outlast the
     /// poll timeout and be killed every time.
     private func calibrateIfDue(_ py: Python) {
-        guard !calibrating, lastCalibration.map({ Date().timeIntervalSince($0) >= 86400 }) ?? true
+        guard !calibrating, lastCalibration.map({ Date().timeIntervalSince($0) >= dailyEvery }) ?? true
         else { return }
         let env = prefs.scriptEnv
         let script = scriptPath
@@ -587,20 +712,150 @@ final class Monitor: ObservableObject {
         lastCalibration = Date()
         DispatchQueue.global(qos: .background).async { [weak self] in
             let r = runTool(py.path, [script, "--calibrate"], env: env, timeout: calibrateTimeout)
-            if let why = r.failure { debug("error: ai-cache-bar.py --calibrate \(why)") }
-            DispatchQueue.main.async { self?.calibrating = false }
+            if let why = r.failure { debug("error: ai-cache-bar.py --calibrate \(why)") } else { debug("calibrate: done") }
+            DispatchQueue.main.async {
+                self?.calibrating = false
+                // Daily too, after the calibration so the two scans never overlap.
+                self?.checkCompat()
+            }
+        }
+    }
+
+    /// `ai-cache-bar.py --compat --json`: at launch, daily, and from Settings. A
+    /// problem is announced once per tool version (the report's `key`).
+    func checkCompat() {
+        guard case .found(let py) = python, !checkingCompat else { return }
+        checkingCompat = true
+        let env = prefs.scriptEnv
+        let script = scriptPath
+        DispatchQueue.global(qos: .background).async { [weak self] in
+            // Exit 1 (problems) and 2 (nothing to check) still print the report.
+            let r = runTool(py.path, [script, "--compat", "--json"], env: env, timeout: calibrateTimeout)
+            let report = try? JSONDecoder().decode(CompatReport.self, from: r.stdout)
+            DispatchQueue.main.async { self?.compatDone(report, r) }
+        }
+    }
+
+    private func compatDone(_ report: CompatReport?, _ r: Ran) {
+        checkingCompat = false
+        guard let report else {
+            compatProblem = "ai-cache-bar.py --compat \(r.failure ?? "printed no report")"
+            debug("error: \(compatProblem!)")
+            return
+        }
+        compat = report
+        compatProblem = nil
+        debug("compat: \(report.key.isEmpty ? "" : report.key + ": ")\(report.summary)")
+        let d = UserDefaults.standard
+        guard report.failures > 0, prefs.notifies, d.string(forKey: "compatNotified") != report.key,
+              let first = report.items.first(where: { !$0.ok && $0.fatal }) else { return }
+        d.set(report.key, forKey: "compatNotified")
+        Notifier.shared.post(
+            title: "CacheBar can't read part of your chats",
+            body: "\(report.key) changed what CacheBar relies on: \(first.serves)"
+                + (report.failures > 1 ? " (+\(report.failures - 1) more)" : "") + ". Click for details.",
+            group: "cachebar-compat", action: .settings)
+    }
+
+    // MARK: Updates
+
+    private var lastUpdateCheck: Date? { UserDefaults.standard.object(forKey: "lastUpdateCheck") as? Date }
+
+    /// A newer release than this build, from the last update check.
+    var availableUpdate: Release? {
+        guard let l = latest, Updates.isNewer(l.version, than: Updates.currentVersion) else { return nil }
+        return l
+    }
+
+    func checkForUpdates() {
+        guard !checkingUpdates else { return }
+        checkingUpdates = true
+        UserDefaults.standard.set(Date(), forKey: "lastUpdateCheck")
+        updateStatus = "Checking…"
+        Updates.fetchLatest { [weak self] result in
+            guard let self else { return }
+            self.checkingUpdates = false
+            switch result {
+            case .failure(let e):
+                debug("update check failed: \(e.localizedDescription)")
+                self.updateStatus = "Check failed: \(e.localizedDescription)"
+            case .success(let r):
+                debug("update check: latest \(r.version), running \(Updates.currentVersion)")
+                let d = UserDefaults.standard
+                d.set(r.version, forKey: "latestVersion")
+                d.set(r.page.absoluteString, forKey: "latestPage")
+                self.latest = r
+                guard let u = self.availableUpdate else {
+                    self.updateStatus = "Up to date (\(Updates.currentVersion))"
+                    return
+                }
+                self.updateStatus = "CacheBar \(u.version) is available"
+                if d.string(forKey: "updateNotified") != u.version {
+                    d.set(u.version, forKey: "updateNotified")
+                    Notifier.shared.post(title: "CacheBar \(u.version) is available",
+                                         body: "You have \(Updates.currentVersion). Click to open the release page.",
+                                         group: "cachebar-update", action: .update)
+                }
+            }
+        }
+    }
+
+    // MARK: Sleep and wake
+
+    private func wentToSleep() {
+        asleep = true
+        debug("sleep: polls paused")
+    }
+
+    /// Back from sleep: what changed meanwhile (chats that went cold overnight) is
+    /// recorded, not announced, as at launch, and the menu refreshes at once rather
+    /// than on the next tick. An unlock without sleep only refreshes: polls and
+    /// notifications went on while the screen was locked.
+    private func cameBack(fromSleep: Bool) {
+        if fromSleep || asleep {
+            asleep = false
+            seeded = false
+            wokeAt = Date()
+            debug("wake: recording what changed while asleep, not announcing it")
+        } else {
+            debug("unlock: refresh")
+        }
+        refresh()
+    }
+
+    /// Test hook: CACHEBAR_TEST_INBOX names a file of actions (one per line),
+    /// consumed on the next tick — a script can't click the menu or sleep the Mac.
+    private func readInbox() {
+        guard let path = appEnv["CACHEBAR_TEST_INBOX"],
+              let text = try? String(contentsOfFile: path, encoding: .utf8) else { return }
+        try? FileManager.default.removeItem(atPath: path)
+        for action in text.split(separator: "\n") {
+            debug("inbox: \(action)")
+            switch action {
+            case "refresh": refresh()
+            case "test notification": sendTestNotification()
+            case "sleep": wentToSleep()
+            case "wake": cameBack(fromSleep: true)
+            case "unlock": cameBack(fromSleep: false)
+            case "click": Notifier.shared.lastAction?.perform()
+            case "check updates": checkForUpdates()
+            case "compat": checkCompat()
+            case "settings": SettingsWindow.shared.show()
+            default: break
+            }
         }
     }
 
     /// Poll now (menu, Settings): right after the running poll, if there is one.
     func refresh() {
+        if asleep { return }
         if polling { pollAgain = true } else { poll() }
     }
 
     /// The 15 s cadence. A poll still running (a slow or hung script) is never
     /// overlapped; it is killed at `scriptTimeout`.
     private func poll() {
-        guard case .found(let py) = python, !polling else { return }
+        guard case .found(let py) = python, !polling, !asleep else { return }
         calibrateIfDue(py)
         guard FileManager.default.fileExists(atPath: scriptPath) else {
             fail(appEnv["CACHEBAR_SCRIPT"] != nil
@@ -611,18 +866,19 @@ final class Monitor: ObservableObject {
         polling = true
         let env = prefs.scriptEnv
         let script = scriptPath
+        let started = Date()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let result = PollResult.read(runTool(py.path, [script, "--json"], env: env, timeout: scriptTimeout))
-            DispatchQueue.main.async { self?.finish(result, python: py) }
+            DispatchQueue.main.async { self?.finish(result, python: py, started: started) }
         }
     }
 
-    private func finish(_ result: PollResult, python py: Python) {
+    private func finish(_ result: PollResult, python py: Python, started: Date) {
         polling = false
         switch result {
         case .data(let rows, let b):
             problem = nil
-            apply(rows, b)
+            apply(rows, b, seeds: wokeAt.map { started >= $0 } ?? true)
         case .failed(let why):
             fail(why)
         case .pythonGone(let why):
@@ -643,7 +899,9 @@ final class Monitor: ObservableObject {
         debug("error: \(why)")
     }
 
-    private func apply(_ rows: [Session], _ newBudget: Budget?) {
+    /// `seeds` false: data from before a wake, recorded but never the baseline
+    /// that later polls announce against.
+    private func apply(_ rows: [Session], _ newBudget: Budget?, seeds: Bool = true) {
         sessions = rows
         budget = newBudget
         dataAt = Date()
@@ -711,7 +969,7 @@ final class Monitor: ObservableObject {
             }
             lastBudgetTight = tight
         }
-        seeded = true
+        if seeds { seeded = true }
     }
 
     /// Verifies delivery end to end, and triggers the authorization prompt on a
@@ -814,6 +1072,25 @@ func printStatus() -> Int32 {
     }
 }
 
+/// `CacheBar --compat`: ai-cache-bar.py --compat with the Python the app would use;
+/// its exit status (0 fine, 1 a problem, 2 nothing to check).
+func printCompat() -> Int32 {
+    guard case .found(let py) = Pythons.resolve(
+        remembered: UserDefaults.standard.string(forKey: rememberedPythonKey)) else {
+        FileHandle.standardError.write("CacheBar: no usable Python 3 (CacheBar --status says why)\n"
+            .data(using: .utf8)!)
+        return 2
+    }
+    let r = runTool(py.path, [scriptPath, "--compat"], env: Prefs.load().scriptEnv, timeout: calibrateTimeout)
+    print(String(decoding: r.stdout, as: UTF8.self), terminator: "")
+    if r.launchError != nil || r.timedOut || r.signaled {
+        FileHandle.standardError.write("CacheBar: ai-cache-bar.py --compat \(r.failure ?? "")\n".data(using: .utf8)!)
+        return 2
+    }
+    if !r.stderr.isEmpty { FileHandle.standardError.write(r.stderr.data(using: .utf8)!) }
+    return r.status
+}
+
 // MARK: - Menu
 
 @main
@@ -838,6 +1115,8 @@ struct CacheBarApp: App {
             exit(0)
         case .status:
             exit(printStatus())
+        case .compat:
+            exit(printCompat())
         case .run:
             Monitor.shared.start()
         }
@@ -865,7 +1144,15 @@ struct CacheBarApp: App {
                     Text("\(r.kind ?? "?") limit capping now · resets in \(hms(r.resets_in))")
                 }
             }
+            if let c = monitor.compat, c.failures > 0 {
+                Divider()
+                Text("⚠️ \(c.key): \(c.summary) — see Settings")
+            }
             Divider()
+            if let u = monitor.availableUpdate {
+                // Not a chat: a release page is safe to open (AGENTS.md rule 6).
+                Button("CacheBar \(u.version) is available…") { Updates.open(u.page) }
+            }
             Toggle("Launch at login", isOn: Binding(
                 get: { monitor.launchAtLogin },
                 set: { monitor.setLaunchAtLogin($0) }))

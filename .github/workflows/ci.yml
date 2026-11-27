@@ -21,6 +21,17 @@ jobs:
           ~/Applications/CacheBar.app/Contents/MacOS/CacheBar --version
           ~/Applications/CacheBar.app/Contents/MacOS/CacheBar --help
 
+      # The app's own self-checks on a fixture HOME: finding a Python on a clean
+      # runner, the bundled script reading the fixture, and --compat passing on it.
+      - name: Self-check (--status, --compat)
+        run: |
+          home=$(mktemp -d)
+          now=$(tests/make-fixtures.py "$home")
+          env -i HOME="$home" PATH=/usr/bin:/bin AI_CACHE_NOW="$now" \
+            ~/Applications/CacheBar.app/Contents/MacOS/CacheBar --status
+          env -i HOME="$home" PATH=/usr/bin:/bin \
+            ~/Applications/CacheBar.app/Contents/MacOS/CacheBar --compat
+
       # Golden tests of ai-cache-bar.py (stdlib Python); no Claude Code needed.
       - name: Script tests
         run: tests/script-tests.sh

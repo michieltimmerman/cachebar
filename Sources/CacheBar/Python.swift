@@ -54,6 +54,11 @@ final class Locked<T> {
         get { lock.lock(); defer { lock.unlock() }; return stored }
         set { lock.lock(); stored = newValue; lock.unlock() }
     }
+    /// A read-modify-write under one lock.
+    func update(_ change: (inout T) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        change(&stored)
+    }
 }
 
 struct Ran {
@@ -90,6 +95,15 @@ struct Ran {
     }
 }
 
+/// The tools running now, so quitting CacheBar ends them too: a `--calibrate` scan
+/// (up to 600 s) would otherwise outlive the app.
+let runningTools = Locked(Set<Process>())
+
+/// Ends every running tool (quit, SIGTERM).
+func terminateRunningTools() {
+    for proc in runningTools.value where proc.isRunning { proc.terminate() }
+}
+
 /// Runs a tool to completion, or kills it after `timeout` (SIGTERM, then SIGKILL).
 /// stdout and stderr drain on their own threads so neither pipe can fill and stall
 /// the child; stdin is /dev/null.
@@ -108,6 +122,8 @@ func runTool(_ path: String, _ args: [String], env: [String: String] = appEnv,
     do { try proc.run() } catch {
         return Ran(launchError: error.localizedDescription, timeout: timeout)
     }
+    runningTools.update { _ = $0.insert(proc) }
+    defer { runningTools.update { _ = $0.remove(proc) } }
 
     let out = Locked(Data()), err = Locked(Data())
     let drained = DispatchGroup()

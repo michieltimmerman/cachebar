@@ -103,6 +103,29 @@ run_case fitted fitted ""
 run_case default default "--thin-history"
 run_case env env "" AI_CACHE_5H_PER_PCT=150000
 
+# --compat: the fixture has everything the script reads (exit 0), and each kind
+# of breakage is named — a lost field fails, a lost title only warns.
+compat_case() {  # label golden-name expected-exit sed-expression
+  local label=$1 name=$2 want_rc=$3 expr=$4 home="$tmp/home-compat-$2" now rc f
+  now="$("$python" "$here/make-fixtures.py" "$home")"
+  if [ -n "$expr" ]; then
+    find "$home/.claude/projects" -name '*.jsonl' | while read -r f; do
+      sed -i '' -e "$expr" "$f"
+    done
+  fi
+  set +e
+  run_script "$home" "$now" compat > "$tmp/$name.compat"
+  rc=$?  # pipefail: the script's own exit
+  set -e
+  check "$label" "$golden/$name.compat" "$tmp/$name.compat"
+  if [ "$rc" = "$want_rc" ]; then pass=$((pass + 1)); else
+    fail=$((fail + 1)); failed="$failed $label-exit"; echo "FAIL $label: exit $rc, expected $want_rc"
+  fi
+}
+compat_case "--compat" compat 0 ""
+compat_case "--compat (cache fields renamed)" compat-broken 1 's/cache_read_input_tokens/cache_reads/g'
+compat_case "--compat (no titles)" compat-untitled 0 's/"ai-title"/"ai-label"/g; s/"custom-title"/"custom-label"/g'
+
 if [ "$update" = 1 ]; then
   echo "script-tests: goldens rewritten in $golden ($fail contract failure(s))"
 else

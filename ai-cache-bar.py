@@ -8,6 +8,10 @@ Surfaces:
   --json       machine-readable (what CacheBar.app consumes)
   --calibrate  remeasure the plan-budget and codex calibrations now (CacheBar.app
                runs this once per launch; otherwise both refresh at most daily)
+  --compat [--json] [claude:PATH] [codex:PATH]
+               check that the files these tools write still have what this
+               script reads: this Mac's data, or a tool's executable (exit 0 ok,
+               1 problems, 2 nothing to check)
 
 Providers, using only data these tools already write locally:
   claude  ~/.claude/projects/**/*.jsonl  — the cache TTL is chosen per request, so
@@ -27,7 +31,7 @@ happens at most once per session.
 
 No deep link can focus an already-open desktop-app chat (README.md documents the
 two claude:// routes that were tried and why each is wrong — one destructively),
-so nothing is clickable: rows and notifications are information only. Rows still
+so no chat is clickable: rows and notifications are information only. Rows still
 carry the transcript path, for reference. The git-worktrees.json mapping is kept
 to collapse a resumed chat's transcripts into one row.
 
@@ -1169,9 +1173,302 @@ def render_notify(rows, b=None):
     save_json(STATE, current)
 
 
+# -------------------------------------------------------------- compatibility
+#
+# Everything above reads files that Claude Code, the desktop app and Codex write
+# for themselves, with no contract behind them. --compat checks that they still
+# look the way this script expects, so a tool update that changes one shows up
+# as a named problem (CacheBar's Settings, and one notification per tool
+# version) instead of quietly wrong countdowns. Two kinds of evidence:
+#   - this Mac's data (no argument): the newest transcripts,
+#     plan-usage-history.json and Codex rollouts;
+#   - a tool's executable (claude:PATH, codex:PATH, a file or a folder): the
+#     field names it writes must still be in it. The weekly upstream-compat
+#     workflow runs this against the newest npm releases.
+# A failure disables something; a warning only weakens it.
+
+COMPAT_SCAN = 20      # newest transcripts / rollouts read (their tails)
+COMPAT_TITLE_SCAN = 5  # newest transcripts read whole for title entries
+
+# (needle, what it serves, fatal). Verified 2026-11-27: all present in Claude
+# Code 2.1.325's binary and in the Codex CLI the ChatGPT app ships.
+CLAUDE_NEEDLES = (
+    ("cache_read_input_tokens", "each chat's cached size", True),
+    ("cache_creation_input_tokens", "cache writes (cold tax, plan budget)", True),
+    ("ephemeral_1h_input_tokens", "the 1-hour cache tier is recognised", False),
+    ("ephemeral_5m_input_tokens", "the 5-minute cache tier is recognised", False),
+    ("requestId", "turns are told apart (streaming partials, retries)", True),
+    ("isSidechain", "subagent turns stay out of the chat rows", True),
+    ("isCompactSummary", "a compaction is noticed (the compacted state)", True),
+    ('"<synthetic>"', "rate-limit notices and compaction stubs are skipped", True),
+    ('"custom-title"', "titles you give a chat", False),
+    ('"ai-title"', "generated chat titles", False),
+    ("quotaLimits", "the rate-limit reset line", False),
+)
+CODEX_NEEDLES = (
+    ("session_meta", "a resumed Codex chat stays one row", True),
+    ("token_count", "Codex turns are found (token_count events)", True),
+    ("last_token_usage", "Codex usage per turn (last_token_usage)", True),
+    ("cached_input_tokens", "each Codex chat's cached size", True),
+    ("thread_name", "Codex chat names (thread_name)", False),
+    ("session_index.jsonl", "Codex chat names (session_index.jsonl)", False),
+)
+
+
+def _item(tool, ok, fatal, serves, detail):
+    return {"tool": tool, "ok": bool(ok), "fatal": fatal, "serves": serves,
+            "detail": "" if ok else detail}
+
+
+def _newest(pattern, n, skip=None):
+    """The n most recently written files matching pattern, newest first."""
+    found = []
+    for path in glob.iglob(pattern, recursive=True):
+        if skip and skip in path:
+            continue
+        try:
+            found.append((os.stat(path).st_mtime, path))
+        except OSError:
+            continue
+    found.sort(reverse=True)
+    return [p for _, p in found[:n]]
+
+
+def _compat_claude_data():
+    """(version, items) from this Mac's newest main transcripts; None without any."""
+    paths = _newest(os.path.join(PROJECTS, "**", "*.jsonl"), COMPAT_SCAN, "/subagents/")
+    if not paths:
+        return None
+    seen = set()
+    version = None
+    for path in paths:
+        for line in reversed(tail_lines(path)):
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(e, dict):
+                continue
+            if version is None and e.get("version"):
+                version = str(e["version"])
+            if "isSidechain" in e:
+                seen.add("sidechain")
+            msg = e.get("message") if isinstance(e.get("message"), dict) else {}
+            usage = msg.get("usage")
+            if not isinstance(usage, dict) or msg.get("model") == "<synthetic>":
+                continue
+            seen.add("usage")
+            if e.get("requestId"):
+                seen.add("requestId")
+            if msg.get("id"):
+                seen.add("message.id")
+            if epoch(e.get("timestamp", "")) is not None:
+                seen.add("timestamp")
+            if "cache_read_input_tokens" in usage and "cache_creation_input_tokens" in usage:
+                seen.add("cache")
+            cc = usage.get("cache_creation")
+            if isinstance(cc, dict) and ("ephemeral_1h_input_tokens" in cc
+                                         or "ephemeral_5m_input_tokens" in cc):
+                seen.add("tier")
+    for path in paths[:COMPAT_TITLE_SCAN]:
+        try:
+            with open(path, "rb") as fh:
+                if any(_titles_from(fh)):
+                    seen.add("title")
+                    break
+        except OSError:
+            continue
+    where = "the newest %d transcripts" % len(paths)
+    t = "claude"
+    return version, [
+        _item(t, "usage" in seen, True, "turns with token usage are found",
+              "no turn with message.usage in " + where),
+        _item(t, "cache" in seen, True, "each chat's cached size",
+              "usage has no cache_read_input_tokens / cache_creation_input_tokens in " + where),
+        _item(t, "timestamp" in seen, True, "countdowns (turn timestamps)",
+              "no turn with a readable timestamp in " + where),
+        _item(t, "requestId" in seen, True, "turns are told apart (requestId)",
+              "no turn with a requestId in " + where),
+        _item(t, "message.id" in seen, True, "token totals are deduplicated (message.id)",
+              "no turn with a message.id in " + where),
+        _item(t, "tier" in seen, False, "the cache tier (1 hour or 5 minutes) is read",
+              "no usage.cache_creation.ephemeral_1h/5m_input_tokens in %s; "
+              "every chat is assumed to use 1 hour" % where),
+        _item(t, "sidechain" in seen, False, "subagent turns stay out of the chat rows",
+              "no entry carries isSidechain in " + where),
+        _item(t, "title" in seen, False, "chat titles",
+              "no custom-title / ai-title entry in the newest %d transcripts"
+              % min(len(paths), COMPAT_TITLE_SCAN)),
+    ]
+
+
+def _compat_plan_data():
+    """(version, items) from plan-usage-history.json; None when there is none."""
+    if not os.path.exists(PLAN_USAGE):
+        return None
+    doc = load_json(PLAN_USAGE, None)
+    samples = doc.get("samples") if isinstance(doc, dict) else None
+    good = 0
+    for s in samples if isinstance(samples, list) else []:
+        u = s.get("u") if isinstance(s, dict) else None
+        if (isinstance(s.get("t"), (int, float)) and isinstance(u, dict)
+                and isinstance(u.get("fh"), (int, float)) and isinstance(u.get("sd"), (int, float))):
+            good += 1
+    version = str(doc.get("version")) if isinstance(doc, dict) and "version" in doc else None
+    return version, [
+        _item("plan", good > 0, True, "plan usage (% of the 5-hour and 7-day limits)",
+              "plan-usage-history.json has no sample shaped {t, u: {fh, sd}}"),
+    ]
+
+
+def _compat_codex_data():
+    """(version, items) from the newest Codex rollouts; None without any."""
+    paths = _newest(os.path.join(CODEX_SESSIONS, "**", "*.jsonl"), COMPAT_SCAN)
+    if not paths:
+        return None
+    seen = set()
+    version = None
+    for path in paths:
+        meta = _codex_meta(path)
+        if meta.get("session_id") or meta.get("id"):
+            seen.add("meta")
+            if version is None and meta.get("cli_version"):
+                version = str(meta["cli_version"])
+        for line in reversed(tail_lines(path)):
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            payload = e.get("payload") if isinstance(e, dict) else None
+            if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                continue
+            usage = (payload.get("info") or {}).get("last_token_usage")
+            if (isinstance(usage, dict) and "input_tokens" in usage
+                    and "cached_input_tokens" in usage):
+                seen.add("usage")
+                break
+    names = any(codex_titles().values())
+    where = "the newest %d rollouts" % len(paths)
+    t = "codex"
+    return version, [
+        _item(t, "meta" in seen, True, "a resumed Codex chat stays one row",
+              "no session_meta line with an id heads " + where),
+        _item(t, "usage" in seen, True, "Codex turns and cached sizes",
+              "no token_count event with last_token_usage.{input_tokens, "
+              "cached_input_tokens} in " + where),
+        _item(t, names, False, "Codex chat names",
+              "~/.codex/session_index.jsonl has no {id, thread_name} entry"),
+    ]
+
+
+def _file_contains(paths, needles):
+    """The needles (bytes) found in any of the files, read in overlapping chunks."""
+    found = set()
+    overlap = max(len(n) for n in needles)
+    for path in paths:
+        try:
+            with open(path, "rb") as fh:
+                tail = b""
+                while len(found) < len(needles):
+                    chunk = fh.read(64 << 20)
+                    if not chunk:
+                        break
+                    data = tail + chunk
+                    found.update(n for n in needles if n in data)
+                    tail = data[-overlap:]
+        except OSError:
+            continue
+    return found
+
+
+def _compat_executable(tool, path):
+    """Items for one tool's executable (a file, or every file under a folder)."""
+    needles = CLAUDE_NEEDLES if tool == "claude" else CODEX_NEEDLES
+    if os.path.isdir(path):
+        files = sorted(os.path.join(d, f) for d, _, fs in os.walk(path) for f in fs)
+    else:
+        files = [path]
+    found = _file_contains(files, [n.encode() for n, _, _ in needles])
+    return [_item(tool, n.encode() in found, fatal, serves, "%s is no longer in %s" % (n, path))
+            for n, serves, fatal in needles]
+
+
+COMPAT_NAMES = {"claude": "Claude Code", "codex": "Codex", "plan": "plan usage"}
+
+
+def compat(targets):
+    """The --compat report: {"versions", "items", "failures", "warnings", "key",
+    "summary"}. `targets` is [(tool, path)] for executables, or [] for local data.
+    `key` names what was checked ("Claude Code 2.1.325"), so CacheBar announces a
+    problem once per tool version."""
+    versions, items = {}, []
+    if targets:
+        for tool, path in targets:
+            versions[tool] = path
+            items += _compat_executable(tool, path)
+    else:
+        for tool, check in (("claude", _compat_claude_data), ("plan", _compat_plan_data),
+                            ("codex", _compat_codex_data)):
+            got = check()
+            if got is not None:
+                versions[tool] = got[0] or "?"
+                items += got[1]
+    failures = sum(1 for i in items if not i["ok"] and i["fatal"])
+    warnings = sum(1 for i in items if not i["ok"] and not i["fatal"])
+    key = ", ".join("%s %s" % (COMPAT_NAMES[t], v) for t, v in sorted(versions.items())
+                    if t != "plan")
+    if not items:
+        summary = "nothing to check: no transcripts, plan usage or Codex rollouts"
+    elif not failures and not warnings:
+        summary = "all %d checks pass" % len(items)
+    else:
+        summary = "%d problem%s, %d warning%s" % (failures, "" if failures == 1 else "s",
+                                                warnings, "" if warnings == 1 else "s")
+    return {"versions": versions, "items": items, "failures": failures,
+            "warnings": warnings, "key": key, "summary": summary}
+
+
+def render_compat(report):
+    for tool, v in sorted(report["versions"].items()):
+        print("%s: %s" % (COMPAT_NAMES[tool], v))
+    for i in report["items"]:
+        tag = "ok   " if i["ok"] else "FAIL " if i["fatal"] else "warn "
+        print("  %s %-7s %s%s" % (tag, i["tool"], i["serves"],
+                                  "" if i["ok"] else " — " + i["detail"]))
+    print("")
+    print(report["summary"])
+
+
 def main():
     mode = "swiftbar"
-    for a in sys.argv[1:]:
+    targets = []
+    as_json = False
+    argv = sys.argv[1:]
+    if "--compat" in argv:
+        # --compat [--json] [claude:PATH] [codex:PATH]
+        for a in argv:
+            if a == "--compat":
+                continue
+            if a == "--json":
+                as_json = True
+            elif a.split(":", 1)[0] in ("claude", "codex") and ":" in a:
+                tool, path = a.split(":", 1)
+                targets.append((tool, os.path.expanduser(path)))
+            else:
+                sys.stderr.write("unknown arg: %s (--compat takes --json, claude:PATH, codex:PATH)\n" % a)
+                return 2
+        missing = [p for _, p in targets if not os.path.exists(p)]
+        if missing:
+            sys.stderr.write("no such file: %s\n" % missing[0])
+            return 2
+        report = compat(targets)
+        if as_json:
+            json.dump(report, sys.stdout, indent=2)
+            print()
+        else:
+            render_compat(report)
+        return 2 if not report["items"] else 1 if report["failures"] else 0
+    for a in argv:
         if a in ("--swiftbar", "--notify", "--text", "--json", "--calibrate"):
             mode = a[2:]
         elif a in ("-h", "--help"):
